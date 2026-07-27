@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kyo-mcp"
+version = "0.1.0"
+description = 'Kyō: A Semantic Knowledge Catalogue MCP Server aligned with Google OKF v0.2.'
+requires-python = ">=3.11"
+dependencies = [
+    "mcp-sdk",           # MCP SDK Core
+    "fastapi>=0.109.0",  # Lightweight server framework
+    "pydantic>=2.8.0",   # Configuration & validation via Pydantic models
+    
+    # Semantic Graphing & Storage Layers
+    "networkx>=3.4.0",   # Graph topology management and traversal algorithms
+    "duckdb>=1.1.0",     # High-performance disk-based analytics for local catalogs
+]
+
+[project.scripts]
+kyo-mcp = "kyo_mcp.mcp_server:main"

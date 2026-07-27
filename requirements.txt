@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+chromadb
+llama-index-mcp
+langchain-community
+langchain-chroma

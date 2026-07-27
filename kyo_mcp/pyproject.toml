@@ -1,0 +1,16 @@
+[project]
+name = "knowledge-catalog-mcp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "duckdb>=1.5.5",
+    "fastapi>=0.140.0",
+    "graphviz>=0.21",
+    "langchain-community>=0.4.2",
+    "mcp>=1.28.1",
+    "networkx>=3.6.1",
+    "pydantic>=2.13.4",
+    "uvicorn>=0.51.0",
+]
