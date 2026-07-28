@@ -4,26 +4,34 @@
 let
   cfg = config.services.kyo;
   
-  # Build the python package using the pyproject.toml defined in the project root
+  # Build the python package using the pyproject.toml defined in the mcp directory
   kyoPackage = pkgs.python3.pkgs.buildPythonApplication {
     pname = "kyo-mcp";
     version = "0.1.0";
-    src = ../../kyo_mcp;
-    
-    buildInputs = with pkgs; [ python3Packages.hatchling ];
+    src = ../../pkg;
+
+    # Set the path to the pyproject.toml file
+    pyprojectToml = ../../pkg/pyproject.toml;
+    format = "pyproject";
+    nativeBuildInputs = with pkgs.python3.pkgs; [ hatchling ];
     
     propagatedBuildInputs = with pkgs.python3.pkgs; [
-      mcp-sdk
       fastapi
+      graphviz
+      httptools
+      langchain-community
+      mcp
       networkx
       pydantic
-      yaml
+      pyyaml
+      uvicorn
+      uvloop
     ];
   };
 
 in {
   options.services.kyo = {
-    enable = lib.mkEnableOption "Kyō Knowledge Catalogue MCP Server";
+    enable = lib.mkEnableOption "Kyo Knowledge Catalogue MCP Server";
     
     environmentFile = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
@@ -43,40 +51,17 @@ in {
       isSystemUser = true;
       group = "kyo";
       home = "/var/lib/kyo";
-      description = "Kyō Knowledge Catalogue Service User";
+      description = "Kyo Knowledge Catalogue Service User";
     };
 
     users.groups.kyo = {};
 
     # Define the systemd service
-    systemd.services.kyo-mcp = {
-      description = "Kyō Semantic Knowledge Catalogue MCP Server";
-      wantedBy = [ "multi-user.target" ];
-      after = [ "network-online.target" ];
-
-      environmentFile = lib.mkIf (cfg.environmentFile != null) cfg.environmentFile;
-
-      serviceConfig = {
-        ExecStart = "${kyoPackage}/bin/kyo-mcp";
-        Restart = "on-failure";
-        
-        # Run as the dedicated user
-        User = "kyo";
-        Group = "kyo";
-        
-        # Set the working directory where our DuckDB will live
-        WorkingDirectory = "/var/lib/kyo";
-        
-        # Security Hardening (Best Practice for NixOS)
-        ReadWritePaths = [ "/var/lib/kyo" ];
-        ProtectSystem = "strict";
-        ProtectHome = "yes";
-        NoNewPrivileges = true;
-        
-        # Logging
-        StandardOutput = "journal";
-        StandardError = "journal";
-      };
-    };
+    preStart = ''
+        if [ ! -f /var/lib/kyo/kyo_catalog.db ]; then
+          cp ${../../pkg/kyo_catalog.db} /var/lib/kyo/kyo_catalog.db
+          chmod 644 /var/lib/kyo/kyo_catalog.db
+        fi
+      '';
   };
 }
