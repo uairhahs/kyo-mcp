@@ -1,7 +1,4 @@
-# Kyo Knowledge Catalogue (KYO)
-
-## Latest Status: Validated & Operational 
-Server architecture has been fixed to support embedded `StreamableHTTP` sessions. All 5 core tools are discoverable and executable.
+# Kyo Knowledge Catalogue MCP
 
 ## What is Kyo?
 

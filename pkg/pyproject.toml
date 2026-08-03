@@ -5,10 +5,9 @@ description = "An MCP server implementing the Open Knowledge Format (OKF) specif
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+  "appdirs>=1.4.4",
   "fastapi>=0.140.0",
-  "graphviz>=0.21",
   "httptools>=0.8.0",
-  "langchain-community>=0.4.2",
   "mcp>=1.28.1",
   "networkx>=3.6.1",
   "pydantic>=2.13.4",
@@ -23,3 +22,25 @@ build-backend = "hatchling.build"
 
 [project.scripts]
 kyo-mcp = "main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kyo_mcp"]
+
+[tool.hatch.envs.test]
+dependencies = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0", "httpx>=0.27.0"]
+
+[tool.hatch.envs.test.scripts]
+test = "pytest tests/ -v"
+test-coverage = "pytest tests/ --cov=kyo_mcp --cov-report=term-missing"
+
+[tool.hatch.envs.default.scripts]
+start = "python -m kyo_mcp.mcp_server"
+lint = "ruff check src/"
+format = "ruff format src/"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[dependency-groups]
+dev = ["coverage>=7.15.2", "pytest-asyncio>=1.4.0"]

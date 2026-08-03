@@ -5,19 +5,27 @@ Aligned with OKF v0.2 requirements for provenance and trust signals.
 """
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = BASE_DIR / "kyo_catalog.db"
+# Use user data directory, not package directory
+import appdirs
+
+DATA_DIR = Path(appdirs.user_data_dir("kyo", "kyo"))
+DB_PATH = DATA_DIR / "kyo_catalog.db"
 conn = None
 
+
 def get_connection() -> sqlite3.Connection:
+    """Lazy initialization - only creates DB when first called."""
     global conn
     if conn is None:
-        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=30.0)
+        # Ensure data directory exists
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        db_path = Path(DB_PATH)
+        conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=30.0)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute("PRAGMA journal_mode=WAL;")
@@ -38,8 +46,12 @@ def get_connection() -> sqlite3.Connection:
             )
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_type ON knowledge_concepts(type);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_status ON knowledge_concepts(status);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_updated_at ON knowledge_concepts(updated_at);")
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_status ON knowledge_concepts(status);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_updated_at ON knowledge_concepts(updated_at);"
+        )
         cur.execute("""
             CREATE TABLE IF NOT EXISTS knowledge_links (
                 source_id TEXT NOT NULL,
@@ -51,8 +63,12 @@ def get_connection() -> sqlite3.Connection:
                 FOREIGN KEY (target_id) REFERENCES knowledge_concepts(id)
             )
         """)
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_link_source ON knowledge_links(source_id);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_link_target ON knowledge_links(target_id);")
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_link_source ON knowledge_links(source_id);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_link_target ON knowledge_links(target_id);"
+        )
         conn.commit()
     return conn
 
@@ -101,7 +117,7 @@ def create_concept(
     if update_existing:
         query += (
             " ON CONFLICT(id) DO UPDATE SET\n"
-            "title = EXCLUDED.title,\n resource = EXCLUDED.resource,\n type = EXCLUDED.type,\n status = EXCLUDED.status,\n tags = EXCLUDED.tags,\n metadata = EXCLUDED.metadata,\n body_text = EXCLUDED.body_text\n"
+            "title = EXCLUDED.title,\n resource = EXCLUDED.resource,\n type = EXCLUDED.type,\n status = EXCLUDED.status,\n tags = EXCLUDED.tags,\n metadata = EXCLUDED.metadata,\n body_text = EXCLUDED.body_text,\n description = EXCLUDED.description\n"
         )
 
     conn.execute(
@@ -228,6 +244,7 @@ def update_node_verified(node_id: str, new_verified_actor: dict) -> bool:
     conn.commit()
     return True
 
+
 def create_link(source_id: str, target_id: str, relation_type: str) -> None:
     """Persist a directed edge between two concepts."""
     conn = get_connection()
@@ -239,6 +256,7 @@ def create_link(source_id: str, target_id: str, relation_type: str) -> None:
         (source_id, target_id, relation_type),
     )
     conn.commit()
+
 
 def get_all_links() -> List[Dict[str, Any]]:
     """Fetch every persisted edge, used to rebuild the in-memory graph on startup."""
