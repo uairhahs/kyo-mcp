@@ -3,3 +3,5 @@
 __pycache__/
 *.py[oc]
 .codebase-memory
+*.db
+!pkg/kyo_catalog.db
