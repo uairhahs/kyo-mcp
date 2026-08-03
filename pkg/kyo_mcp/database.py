@@ -5,7 +5,6 @@ Aligned with OKF v0.2 requirements for provenance and trust signals.
 """
 
 import json
-import os
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -231,7 +230,10 @@ def update_node_verified(node_id: str, new_verified_actor: dict) -> bool:
     verified_list = meta.get("verified", [])
 
     # Avoid duplicates
-    new_entry = {**new_verified_actor, "by": f"human:{new_verified_actor['by']}"}
+    new_entry = {
+        **new_verified_actor,
+        "by": f"human:{new_verified_actor.get('by', '')}",
+    }
     if new_entry not in verified_list:
         verified_list.append(new_entry)
 

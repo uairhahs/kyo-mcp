@@ -21,10 +21,10 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project.scripts]
-kyo-mcp = "main:main"
+kyo-mcp = "start_http:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/kyo_mcp"]
+packages = ["kyo_mcp"]
 
 [tool.hatch.envs.test]
 dependencies = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0", "httpx>=0.27.0"]
@@ -35,8 +35,8 @@ test-coverage = "pytest tests/ --cov=kyo_mcp --cov-report=term-missing"
 
 [tool.hatch.envs.default.scripts]
 start = "python -m kyo_mcp.mcp_server"
-lint = "ruff check src/"
-format = "ruff format src/"
+lint = "ruff check kyo_mcp/"
+format = "ruff format kyo_mcp/"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

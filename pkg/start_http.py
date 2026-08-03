@@ -1,9 +1,6 @@
-import sys
 from contextlib import asynccontextmanager
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / "src"))
-
+import uvicorn
 from fastapi import FastAPI
 from kyo_mcp.mcp_server import mcp as server_instance
 
@@ -23,3 +20,17 @@ def index():
 
 
 app.mount("/", server_instance.streamable_http_app())
+
+
+def main():
+    uvicorn.run(
+        "start_http:app",
+        host="127.0.0.1",
+        port=8000,
+        loop="uvloop",  # High-performance event loop
+        http="httptools",  # Faster HTTP request parsing
+    )
+
+
+if __name__ == "__main__":
+    main()

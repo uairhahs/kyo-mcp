@@ -6,17 +6,9 @@ Specifically enforces strict `generated`, `verified`, and `sources` structures d
 
 import datetime
 import logging
-import sys
-from pathlib import Path
 from typing import Dict, List, Optional
 
 import networkx as nx
-from mcp.server.fastmcp import FastMCP
-from pydantic import BaseModel, Field
-
-# Ensure local source package is importable when run via Nix or uv
-sys.path.insert(0, str(Path(__file__).parents[1]))
-
 from kyo_mcp.database import (
     create_concept,
     create_link,
@@ -26,6 +18,8 @@ from kyo_mcp.database import (
     update_node_verified,
 )
 from kyo_mcp.okf_schema import GeneratedInfo, OKFConcept, ProvenanceSource
+from mcp.server.fastmcp import FastMCP
+from pydantic import BaseModel, Field
 
 # Global State (In-memory graph + persistent DB sync)
 G = nx.DiGraph()  # Directed Graph for Knowledge Links
@@ -141,7 +135,6 @@ async def link_kyo_nodes(source_id: str, target_id: str, relation_type: str) -> 
     return f"Links {source_id} -> {target_id} ({relation_type})"
 
 
-
 @mcp.tool()
 async def search_knowledge(query: QueryInput) -> str:
     """Semantic search across the Kyo Knowledge Catalogue."""
@@ -204,7 +197,7 @@ async def get_node_trust_status(node_id: str) -> str:
     verified_list = r.get("verified", [])
     tier = "Unverified"
     if verified_list:
-        actors = [v["by"] for v in verified_list]
+        actors = [v.get("by", "") for v in verified_list]
         if any(a.startswith("human:") for a in actors):
             tier = "Human-Reviewed"
         elif any(a.startswith("process:") for a in actors):

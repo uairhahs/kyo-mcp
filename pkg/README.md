@@ -17,9 +17,8 @@ kyo-mcp
 
 ## Architecture
 
-- **Package**: `src/kyo_mcp/` — core modules
-- **Entry point**: `main.py` — runs uvicorn with `start_http:app`
-- **App**: `start_http.py` — mounts the MCP server on the FastAPI app at `/mcp/`
+- **Package**: `kyo_mcp/` — core modules
+- **App/Entry point**: `start_http.py` — FastAPI app mounting the MCP server at `/mcp/`, plus the `kyo-mcp` uvicorn entry point
 - **Database**: SQLite with tables for concepts and links
 
 ## MCP Tools
@@ -60,14 +59,12 @@ Implements the OKF v0.2 specification with:
 
 ```
 pkg/
-├── main.py                 # Uvicorn entry point
-├── start_http.py           # FastAPI app with MCP server
-├── src/
-│   └── kyo_mcp/
-│       ├── __init__.py     # Graph instance & data dir setup
-│       ├── database.py     # SQLite persistence layer
-│       ├── okf_schema.py   # OKF v0.2 schema models
-│       └── mcp_server.py   # MCP tool implementations
+├── start_http.py           # FastAPI app + uvicorn entry point
+├── kyo_mcp/
+│   ├── __init__.py         # Graph instance & data dir setup
+│   ├── database.py         # SQLite persistence layer
+│   ├── okf_schema.py       # OKF v0.2 schema models
+│   └── mcp_server.py       # MCP tool implementations
 └── tests/                  # Test suite
 ```
 
