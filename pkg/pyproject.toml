@@ -27,7 +27,12 @@ kyo-mcp = "start_http:main"
 packages = ["kyo_mcp"]
 
 [tool.hatch.envs.test]
-dependencies = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0", "httpx>=0.27.0"]
+dependencies = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.23.0",
+  "httpx>=0.27.0",
+  "appdirs>=1.4.4",
+]
 
 [tool.hatch.envs.test.scripts]
 test = "pytest tests/ -v"
