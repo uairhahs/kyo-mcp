@@ -1,3 +1,7 @@
+# Generated artifacts
+!pkg/kyo_catalog.db
+*.db
+
 # local files
 .local
 AGENTS.md
@@ -6,8 +10,7 @@ AGENTS.md
 __pycache__/
 *.py[oc]
 .codebase-memory
-*.db
-!pkg/kyo_catalog.db
+
 # Python environment
 .env/
 *.egg-info/
