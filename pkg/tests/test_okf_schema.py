@@ -1,10 +1,5 @@
 """Tests for OKF schema models."""
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-
 from kyo_mcp.okf_schema import (
     GeneratedInfo,
     OKFConcept,

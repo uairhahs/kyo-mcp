@@ -19,7 +19,7 @@
 >   files into context, a search index, or a graph viewer like the one
 >   bundled in this repo.
 >
-> The agent below is a **proof of concept** demonstrating *one* way to
+> The agent below is a **proof of concept** demonstrating _one_ way to
 > produce OKF bundles automatically. The format itself is the
 > contribution; this agent and the visualizer exist to make the format
 > tangible at both ends — production and consumption.
@@ -162,8 +162,8 @@ viewing side. Open it in any modern browser, share it as an artifact,
 host it on a static file server, or commit it next to the bundle (as
 this repo does).
 
-The viewer is itself a proof-of-concept *consumer* of OKF, mirroring
-the way the reference agent is a proof-of-concept *producer*. OKF
+The viewer is itself a proof-of-concept _consumer_ of OKF, mirroring
+the way the reference agent is a proof-of-concept _producer_. OKF
 bundles can be consumed by anything that reads markdown; this is just
 one shape.
 
@@ -190,11 +190,11 @@ one shape.
 
 That writes `bundles/<name>/viz.html`. Flags:
 
-| Flag           | Default                | Description                                 |
-|----------------|------------------------|---------------------------------------------|
-| `--bundle`     | *(required)*           | Bundle root directory.                      |
-| `--out`        | `<bundle>/viz.html`    | Output HTML path.                           |
-| `--name`       | bundle directory name  | Display name shown in the viewer header.    |
+| Flag       | Default               | Description                              |
+| ---------- | --------------------- | ---------------------------------------- |
+| `--bundle` | _(required)_          | Bundle root directory.                   |
+| `--out`    | `<bundle>/viz.html`   | Output HTML path.                        |
+| `--name`   | bundle directory name | Display name shown in the viewer header. |
 
 Example, writing the output somewhere else and overriding the header:
 

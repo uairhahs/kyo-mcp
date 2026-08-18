@@ -1,12 +1,6 @@
 """Tests for MCP server tools."""
 
-import sys
-from pathlib import Path
-
 import pytest
-
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-
 from kyo_mcp.mcp_server import (
     G,
     QueryInput,

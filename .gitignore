@@ -8,3 +8,8 @@ __pycache__/
 .codebase-memory
 *.db
 !pkg/kyo_catalog.db
+# Python environment
+.env/
+*.egg-info/
+dist/
+build/

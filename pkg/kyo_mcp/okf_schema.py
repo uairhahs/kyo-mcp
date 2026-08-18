@@ -5,6 +5,7 @@ Aligns exactly with the source-of-truth Markdown structure defined by Google's k
 
 from typing import Any, Dict, List, Optional
 
+from kyo_mcp.ontology import OntologyAnnotation
 from pydantic import BaseModel
 
 
@@ -58,6 +59,9 @@ class OKFConcept(BaseModel):
     verified: Optional[List[VerificationEntry]] = None
     sources: List[ProvenanceSource] = []
     metadata: Dict[str, Any] = {}
+
+    # Ontology annotations (lightweight, optional)
+    ontology: Optional[OntologyAnnotation] = None
 
     def to_markdown(self) -> str:
         """Serializes the concept into an OKF-compliant Markdown bundle file."""
