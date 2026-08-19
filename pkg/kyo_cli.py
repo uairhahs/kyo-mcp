@@ -50,8 +50,7 @@ def cmd_search_concepts(args: argparse.Namespace) -> str:
 def cmd_get_concept(args: argparse.Namespace) -> str:
     """Get concept by ID."""
     db_path = Path("/path/to/kyo/pkg/kyo_catalog.db")
-    conn = get_connection(db_path)
-    concept = get_concept_by_id(conn, args.concept_id)
+    concept = get_concept_by_id(args.concept_id, db_path=db_path)
     if concept:
         return json.dumps(concept, default=str)
     else:
@@ -144,7 +143,7 @@ async def cmd_sync_to_hindsight(args: argparse.Namespace) -> str:
         if isinstance(concept_data.get("metadata"), str):
             try:
                 concept_data["metadata"] = json.loads(concept_data["metadata"])
-            except:
+            except Exception:
                 concept_data["metadata"] = {}
         from kyo_mcp.okf_schema import OKFConcept
 
