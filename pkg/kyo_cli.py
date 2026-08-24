@@ -22,7 +22,6 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from typing import Optional
 
 # Add pkg directory to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -39,8 +38,9 @@ from kyo_mcp.database import (
 
 def cmd_search_concepts(args: argparse.Namespace) -> str:
     """Search concepts by query."""
+    query = " ".join(args.query) if args.query else ""
     db_path = Path("/path/to/kyo/pkg/kyo_catalog.db")
-    results = query_catalog(search_term=args.query, db_path=db_path)
+    results = query_catalog(search_term=query, db_path=db_path)
     # Apply limit if specified
     if args.limit and args.limit > 0:
         results = results[: args.limit]
@@ -75,9 +75,7 @@ def cmd_create_concept(args: argparse.Namespace) -> str:
             }
         ],
     }
-    result = create_concept(
-        concept_dict, markdown_body=args.content or "", db_path=db_path
-    )
+    create_concept(concept_dict, markdown_body=args.content or "", db_path=db_path)
     return json.dumps({"created": True, "concept_id": concept_dict["id"]})
 
 
@@ -97,10 +95,11 @@ def cmd_create_link(args: argparse.Namespace) -> str:
 
 def cmd_query_catalog(args: argparse.Namespace) -> str:
     """Query the catalog."""
+    query = " ".join(args.query) if args.query else ""
     db_path = Path("/path/to/kyo/pkg/kyo_catalog.db")
-    conn = get_connection(db_path)
+    get_connection(db_path)
     results = query_catalog(
-        search_term=args.query,
+        search_term=query,
         db_path=db_path,
     )
     # Apply filters
@@ -158,8 +157,9 @@ async def cmd_sync_to_hindsight(args: argparse.Namespace) -> str:
 async def cmd_recall_from_hindsight(args: argparse.Namespace) -> str:
     """Recall from Hindsight."""
     try:
+        query = " ".join(args.query) if args.query else ""
         bridge = BridgeLayer()
-        result = await bridge.recall_from_hindsight(args.query, top_k=args.limit or 10)
+        result = await bridge.recall_from_hindsight(query, top_k=args.limit or 10)
         return json.dumps(result, default=str)
     except Exception as e:
         return json.dumps({"error": str(e)})
@@ -182,7 +182,9 @@ async def main():
 
     # search_concepts
     p_search = subparsers.add_parser("search_concepts")
-    p_search.add_argument("query", type=str)
+    p_search.add_argument(
+        "query", type=str, nargs="*", help="Search query (words joined with spaces)"
+    )
     p_search.add_argument("--limit", type=int, default=10)
 
     # get_concept
@@ -204,7 +206,9 @@ async def main():
 
     # query_catalog
     p_query = subparsers.add_parser("query_catalog")
-    p_query.add_argument("query", type=str)
+    p_query.add_argument(
+        "query", type=str, nargs="*", help="Search query (words joined with spaces)"
+    )
     p_query.add_argument("--limit", type=int, default=10)
     p_query.add_argument("--verified-only", action="store_true")
 
@@ -218,7 +222,9 @@ async def main():
 
     # recall_from_hindsight
     p_recall = subparsers.add_parser("recall_from_hindsight")
-    p_recall.add_argument("query", type=str)
+    p_recall.add_argument(
+        "query", type=str, nargs="*", help="Search query (words joined with spaces)"
+    )
     p_recall.add_argument("--limit", type=int, default=10)
 
     # sync_all
