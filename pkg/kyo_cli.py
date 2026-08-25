@@ -176,6 +176,16 @@ async def cmd_sync_all(args: argparse.Namespace) -> str:
         return json.dumps({"error": str(e)})
 
 
+async def cmd_trigger_consolidation(args: argparse.Namespace) -> str:
+    """Trigger Hindsight consolidation/reflection on active concepts."""
+    try:
+        bridge = BridgeLayer()
+        result = await bridge.trigger_consolidation()
+        return json.dumps({"success": result})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
 async def main():
     parser = argparse.ArgumentParser(description="Kyo CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -230,6 +240,9 @@ async def main():
     # sync_all
     subparsers.add_parser("sync_all")
 
+    # trigger_consolidation
+    subparsers.add_parser("trigger_consolidation")
+
     args = parser.parse_args()
 
     # Map commands to functions
@@ -243,6 +256,7 @@ async def main():
         "sync_to_hindsight": cmd_sync_to_hindsight,  # async
         "recall_from_hindsight": cmd_recall_from_hindsight,  # async
         "sync_all": cmd_sync_all,  # async
+        "trigger_consolidation": cmd_trigger_consolidation,  # async
     }
 
     try:
