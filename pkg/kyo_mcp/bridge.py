@@ -14,6 +14,7 @@ Usage:
 """
 
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from kyo_mcp.database import (
@@ -36,25 +37,31 @@ class BridgeLayer:
     Attributes:
         db_path: Path to the SQLite database
         mnemosyne_config: Configuration for Mnemosyne integration
-        hindsight_url: URL for Hindsight API (default: http://localhost:8888)
+        hindsight_url: URL for Hindsight API (default: $HINDSIGHT_API_BASE_URL,
+            falling back to http://localhost:8888)
     """
 
     def __init__(
         self,
         db_path: str = "kyo.db",
         mnemosyne_config: Optional[Dict[str, Any]] = None,
-        hindsight_url: str = "http://localhost:8888",
+        hindsight_url: Optional[str] = None,
     ):
         """Initialize the bridge layer.
 
         Args:
             db_path: Path to the SQLite database
             mnemosyne_config: Configuration for Mnemosyne integration
-            hindsight_url: URL for Hindsight API
+            hindsight_url: URL for Hindsight API. Defaults to the
+                HINDSIGHT_API_BASE_URL env var (matching
+                tests/test_hindsight_integration.py), then
+                http://localhost:8888.
         """
         self.db_path = db_path
         self.mnemosyne_config = mnemosyne_config or {}
-        self.hindsight_url = hindsight_url
+        self.hindsight_url = hindsight_url or os.environ.get(
+            "HINDSIGHT_API_BASE_URL", "http://localhost:8888"
+        )
 
     async def sync_concept_to_mnemosyne(self, concept: OKFConcept) -> bool:
         """Sync an OKF concept to Mnemosyne for spaced repetition.

@@ -1,4 +1,4 @@
-# Kyo 2.0 — Knowledge Graph MCP Server
+# Kyo 2.0 - Knowledge Graph MCP Server
 
 **MCP 2026-07-28 | Mnemosyne | Hindsight | OKF v0.2**
 
@@ -97,15 +97,15 @@ kyo/
 
 ## Hindsight Setup
 
-Hindsight runs in local mode on the-hindsight-host with Ornith-9B via llama.cpp:
+Deploy Hindsight however suits your environment (Docker, Kubernetes, bare
+metal). By default `BridgeLayer` looks for it at `http://localhost:8888`;
+if it runs elsewhere, set `HINDSIGHT_API_BASE_URL` to point at it:
 
 ```bash
-# Clone and deploy
-cd /path/to/hindsight-deployment
-docker compose up -d
+export HINDSIGHT_API_BASE_URL=http://your-hindsight-host:8888
 
 # Verify
-curl http://localhost:8888/v1/default/banks | jq '.[0]'
+curl "$HINDSIGHT_API_BASE_URL/v1/default/banks" | jq '.[0]'
 ```
 
 ## License

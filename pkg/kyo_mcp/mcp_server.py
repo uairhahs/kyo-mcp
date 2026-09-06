@@ -364,12 +364,29 @@ async def sync_all_to_memory_systems() -> str:
 
 def main():
     """Entry point for the Kyo MCP service."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Kyo MCP Server")
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse", "streamable-http"],
+        default="stdio",
+        help="Transport protocol (default: stdio)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port for streamable-http transport (default: 8000)",
+    )
+    args = parser.parse_args()
+
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("kyo")
 
-    logger.info("Starting Kyo Knowledge Catalogue...")
+    logger.info(f"Starting Kyo Knowledge Catalogue with {args.transport} transport...")
     load_graph_data()
-    mcp.run()
+    mcp.run(transport=args.transport, port=args.port)
 
 
 if __name__ == "__main__":

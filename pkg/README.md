@@ -1,79 +1,128 @@
-# Kyo MCP
+# Kyo MCP Server
 
-A FastAPI-based MCP (Model Context Protocol) server that implements the [Open Knowledge Format (OKF) v0.2 specification](https://openknowledge.network/). It persists a knowledge graph in SQLite and exposes it via MCP tools and a web API.
+A knowledge graph MCP server implementing the [Open Knowledge Format (OKF) v0.2](https://openknowledge.network/) specification with integrated spaced repetition (Mnemosyne) and AI-powered fact extraction (Hindsight).
+
+## Architecture
+
+```text
+┌─────────────────────────────────────────────────────────┐
+│                     MCP Client                           │
+│              (Pi, Claude Desktop, etc.)                  │
+└──────────────────────┬──────────────────────────────────┘
+                       │ stdio / streamable-http
+                       ▼
+┌─────────────────────────────────────────────────────────┐
+│                   Kyo MCP Server                         │
+│  ┌───────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐  │
+│  │  Bridge   │ │ Database │ │  Ontology│ │  OKF     │  │
+│  │ (Sync)    │ │ (SQLite) │ │ (RDF)    │ │ Schema   │  │
+│  └─────┬─────┘ └────┬─────┘ └──────────┘ └──────────┘  │
+│        │            │                                     │
+│        ▼            ▼                                     │
+│  ┌──────────┐  ┌──────────┐                               │
+│  │ Mnemosyne│  │Hindsight │                               │
+│  │(SRS)     │  │(LLM)     │                               │
+│  └──────────┘  └──────────┘                               │
+└─────────────────────────────────────────────────────────┘
+```
 
 ## Quick Start
 
 ```bash
-python -m uvicorn start_http:app --host 0.0.0.0 --port 8000
+# Run tests
+cd pkg && uv run pytest tests/ -v
+
+# Start MCP server (stdio - default)
+uv run python -m kyo_mcp.mcp_server
+
+# Start MCP server (streamable HTTP on port 8000)
+uv run python -m kyo_mcp.mcp_server --transport streamable-http --port 8000
+
+# Start MCP server (SSE)
+uv run python -m kyo_mcp.mcp_server --transport sse --port 8000
 ```
 
-Or use the package entry point:
+## Transport Options
 
-```bash
-pip install -e .
-kyo-mcp
-```
-
-## Architecture
-
-- **Package**: `kyo_mcp/` — core modules
-- **App/Entry point**: `start_http.py` — FastAPI app mounting the MCP server at `/mcp/`, plus the `kyo-mcp` uvicorn entry point
-- **Database**: SQLite with tables for concepts and links
+| Transport         | Use Case                    | Command                                                                       |
+| ----------------- | --------------------------- | ----------------------------------------------------------------------------- |
+| `stdio`           | Local development, Pi agent | `uv run python -m kyo_mcp.mcp_server`                                         |
+| `streamable-http` | Remote access, production   | `uv run python -m kyo_mcp.mcp_server --transport streamable-http --port 8000` |
+| `sse`             | Server-Sent Events          | `uv run python -m kyo_mcp.mcp_server --transport sse --port 8000`             |
 
 ## MCP Tools
 
-| Tool                    | Description                                      |
-| ----------------------- | ------------------------------------------------ |
-| `create_kyo_node`       | Create a new concept node in the knowledge graph |
-| `link_kyo_nodes`        | Create a relationship between two nodes          |
-| `search_knowledge`      | Search concepts by keyword                       |
-| `verify_kyo_node`       | Mark a node as human-verified                    |
-| `get_node_trust_status` | Get verification status of a node                |
+| Tool                         | Description                               |
+| ---------------------------- | ----------------------------------------- |
+| `create_kyo_node`            | Create a new OKF-compliant knowledge node |
+| `link_kyo_nodes`             | Connect nodes with directed edges         |
+| `search_knowledge`           | Semantic search across the catalogue      |
+| `verify_kyo_node`            | Mark a node as human-verified             |
+| `get_node_trust_status`      | Get trust/provenance metadata             |
+| `sync_to_mnemosyne`          | Sync to spaced repetition system          |
+| `sync_to_hindsight`          | Sync for AI-powered fact extraction       |
+| `recall_from_hindsight`      | Semantic search via Hindsight             |
+| `trigger_reflection`         | Generate insights via Hindsight           |
+| `trigger_consolidation`      | Strengthen memory associations            |
+| `sync_all_to_memory_systems` | Batch sync all concepts                   |
 
-## Web API
+## OKF v0.2 Compliance
 
-The server exposes a FastAPI app with the following endpoints:
-
-- `GET /` — Index page
-- `POST /mcp/` — MCP protocol endpoint
+- **Trust Signals**: `generated` (always), optional `verified`, `sources`
+- **Freshness**: `stale_after` metadata
+- **Provenance**: Tracking of node creation and verification
+- **Schema**: Pydantic models for OKF concepts
 
 ## Configuration
 
-Set via environment variables:
+Environment variables:
 
-- `KYO_DATA_DIR` — Directory for SQLite database (default: `/var/lib/kyo`)
-- `DATABASE_URL` — Database connection string (default: `sqlite:///kyo.db` relative to data dir)
-
-## OKF Compliance
-
-Implements the OKF v0.2 specification with:
-
-- Concept nodes with metadata, tags, and verification status
-- Link relationships between concepts
-- Trust signals (human-verified status)
-- Provenance tracking
-- Resource URIs
+- `KYO_DATA_DIR` — Directory for SQLite database (default: current directory)
+- `DATABASE_URL` — Database connection string (default: `sqlite:///kyo.db`)
 
 ## Project Structure
 
-```
+```text
 pkg/
-├── start_http.py           # FastAPI app + uvicorn entry point
 ├── kyo_mcp/
-│   ├── __init__.py         # Graph instance & data dir setup
-│   ├── database.py         # SQLite persistence layer
-│   ├── okf_schema.py       # OKF v0.2 schema models
-│   └── mcp_server.py       # MCP tool implementations
-└── tests/                  # Test suite
+│   ├── mcp_server.py       # MCP 2026-07-28 server (MCPServer)
+│   ├── database.py         # SQLite schema + NetworkX graph
+│   ├── okf_schema.py       # OKF v0.2 Pydantic models
+│   ├── ontology.py         # SKOS/Dublin Core + RDF export
+│   ├── bridge.py           # Mnemosyne + Hindsight sync
+│   └── __init__.py
+├── tests/                  # Test suite (103 passing)
+├── pyproject.toml
+└── README.md
 ```
 
 ## Development
 
 ```bash
 # Run tests
-pytest pkg/tests/
+uv run pytest tests/ -v
 
-# Run with auto-reload
-uvicorn start_http:app --reload
+# Run linting
+trunk check --fix
 ```
+
+## Integration
+
+### MCP Client
+
+Configure in `~/.mcp-client/settings.json`:
+
+```json
+{
+  "transport": "auto",
+  "command": "cd /path/to/kyo/pkg && uv run python -m kyo_mcp.mcp_server"
+}
+```
+
+### Hindsight
+
+Running on `localhost:8888` (API) and `localhost:9999` (UI) for semantic search and reflection.
+
+## License
+
+MIT
