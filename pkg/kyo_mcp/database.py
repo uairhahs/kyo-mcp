@@ -167,6 +167,11 @@ def _deserialize_concept(row: sqlite3.Row) -> Dict[str, Any]:
     row_dict["verified"] = metadata.get("verified", [])
     row_dict["sources"] = metadata.get("sources", [])
     row_dict["stale_after"] = metadata.get("stale_after")
+    # OKFConcept.metadata is a genuine Dict[str, Any] field, separate from
+    # generated/verified/sources/stale_after above. It must not be left as
+    # the raw SQLite TEXT column, or OKFConcept.model_validate() fails with
+    # "Input should be a valid dictionary" on every row.
+    row_dict["metadata"] = metadata
     return row_dict
 
 

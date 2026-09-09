@@ -12,6 +12,16 @@ from kyo_mcp.okf_schema import OKFConcept
 HINDSIGHT_BASE_URL = os.environ.get("HINDSIGHT_API_BASE_URL", "http://localhost:8888")
 TEST_BANK_ID = "kyo-test"
 
+# None of these calls used to set a requests timeout, so a slow or
+# overloaded Hindsight backend hung the whole test run indefinitely instead
+# of failing (confirmed 2026-09-09 against a CPU-only LLM backend under
+# concurrent load). HTTP_TIMEOUT covers plain reads; LLM_TIMEOUT covers
+# anything that touches Hindsight's extraction/reflection/consolidation
+# pipeline and is generous on purpose, since CPU-only prompt processing on
+# a large context can legitimately take well over a minute.
+HTTP_TIMEOUT = 30
+LLM_TIMEOUT = 180
+
 # Check if LLM is available (for fact extraction and reflection)
 # In 'none' mode, we can store/recall but not reflect
 HAS_LLM = (
@@ -26,7 +36,7 @@ class TestHindsightConnection:
 
     def test_api_health(self):
         """Test that Hindsight API is healthy."""
-        response = requests.get(f"{HINDSIGHT_BASE_URL}/health")
+        response = requests.get(f"{HINDSIGHT_BASE_URL}/health", timeout=HTTP_TIMEOUT)
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "healthy"
@@ -34,14 +44,16 @@ class TestHindsightConnection:
 
     def test_api_version(self):
         """Test that we can get API version."""
-        response = requests.get(f"{HINDSIGHT_BASE_URL}/version")
+        response = requests.get(f"{HINDSIGHT_BASE_URL}/version", timeout=HTTP_TIMEOUT)
         assert response.status_code == 200
         data = response.json()
         assert "api_version" in data or "version" in data
 
     def test_list_banks(self):
         """Test listing banks."""
-        response = requests.get(f"{HINDSIGHT_BASE_URL}/v1/default/banks")
+        response = requests.get(
+            f"{HINDSIGHT_BASE_URL}/v1/default/banks", timeout=HTTP_TIMEOUT
+        )
         assert response.status_code == 200
         data = response.json()
         assert "banks" in data
@@ -58,6 +70,7 @@ class TestHindsightMemoryOperations:
         response = requests.post(
             f"{HINDSIGHT_BASE_URL}/v1/default/banks/{TEST_BANK_ID}/memories",
             json={"items": [{"content": "Test setup memory", "importance": 1}]},
+            timeout=LLM_TIMEOUT,
         )
         assert response.status_code in [200, 201]
 
@@ -70,6 +83,7 @@ class TestHindsightMemoryOperations:
                     {"content": "Test memory for Kyo integration", "importance": 5}
                 ]
             },
+            timeout=LLM_TIMEOUT,
         )
         assert response.status_code in [200, 201]
         data = response.json()
@@ -85,6 +99,7 @@ class TestHindsightMemoryOperations:
         response = requests.post(
             f"{HINDSIGHT_BASE_URL}/v1/default/banks/{TEST_BANK_ID}/memories/recall",
             json={"query": "test memory", "top_k": 5},
+            timeout=LLM_TIMEOUT,
         )
         assert response.status_code == 200
         data = response.json()
@@ -99,6 +114,7 @@ class TestHindsightMemoryOperations:
         response = requests.get(
             f"{HINDSIGHT_BASE_URL}/v1/default/banks/{TEST_BANK_ID}/memories/list",
             params={"limit": 10},
+            timeout=HTTP_TIMEOUT,
         )
         assert response.status_code == 200
         data = response.json()
@@ -115,6 +131,7 @@ class TestHindsightReflection:
         requests.post(
             f"{HINDSIGHT_BASE_URL}/v1/default/banks/{TEST_BANK_ID}/memories",
             json={"items": [{"content": "Setup memory", "importance": 1}]},
+            timeout=LLM_TIMEOUT,
         )
 
         # Store some memories
@@ -126,6 +143,7 @@ class TestHindsightReflection:
                         {"content": f"Test memory {i} for reflection", "importance": 3}
                     ]
                 },
+                timeout=LLM_TIMEOUT,
             )
 
     def test_reflect(self):
@@ -136,6 +154,7 @@ class TestHindsightReflection:
                 "query": "What do I know about test memories?",
                 "mode": "observations",
             },
+            timeout=LLM_TIMEOUT,
         )
         assert response.status_code == 200
         data = response.json()
@@ -151,6 +170,7 @@ class TestOKFHindsightSync:
         response = requests.post(
             f"{HINDSIGHT_BASE_URL}/v1/default/banks/{TEST_BANK_ID}/memories",
             json={"items": [{"content": "Setup memory", "importance": 1}]},
+            timeout=LLM_TIMEOUT,
         )
         assert response.status_code in [200, 201]
 
@@ -168,6 +188,7 @@ class TestOKFHindsightSync:
         response = requests.post(
             f"{HINDSIGHT_BASE_URL}/v1/default/banks/{TEST_BANK_ID}/memories",
             json={"items": [{"content": content, "importance": 5}]},
+            timeout=LLM_TIMEOUT,
         )
         assert response.status_code in [200, 201]
 
@@ -187,6 +208,7 @@ class TestOKFHindsightSync:
         response = requests.post(
             f"{HINDSIGHT_BASE_URL}/v1/default/banks/{TEST_BANK_ID}/memories",
             json={"items": [{"content": content, "tags": tags, "importance": 5}]},
+            timeout=LLM_TIMEOUT,
         )
         assert response.status_code in [200, 201]
 
@@ -201,6 +223,7 @@ class TestHindsightConsolidation:
         requests.post(
             f"{HINDSIGHT_BASE_URL}/v1/default/banks/{TEST_BANK_ID}/memories",
             json={"items": [{"content": "Setup memory", "importance": 1}]},
+            timeout=LLM_TIMEOUT,
         )
 
         # Store some memories
@@ -215,6 +238,7 @@ class TestHindsightConsolidation:
                         }
                     ]
                 },
+                timeout=LLM_TIMEOUT,
             )
 
     def test_consolidate(self):
@@ -222,6 +246,7 @@ class TestHindsightConsolidation:
         response = requests.post(
             f"{HINDSIGHT_BASE_URL}/v1/default/banks/{TEST_BANK_ID}/consolidate",
             json={"mode": "full"},
+            timeout=LLM_TIMEOUT,
         )
         # Consolidation may be async, so we just check it starts
         assert response.status_code in [200, 202]

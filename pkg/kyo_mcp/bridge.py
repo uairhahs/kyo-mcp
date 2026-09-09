@@ -26,6 +26,17 @@ from kyo_mcp.okf_schema import (
 
 logger = logging.getLogger(__name__)
 
+# No call into Hindsight ever set a `requests` timeout, so a slow or
+# overloaded backend (confirmed 2026-09-09: a CPU-only LLM backend under
+# concurrent load left `requests.post()` waiting indefinitely rather than
+# failing) hung every caller instead of returning a clear error. Every
+# endpoint here touches Hindsight's LLM pipeline in some way (extraction,
+# embedding/reranking, reflection, consolidation), so one generous timeout
+# covers all of them. It is generous on purpose: CPU-only prompt processing
+# on a large context can legitimately take well over a minute before
+# generation even starts.
+LLM_TIMEOUT = 180
+
 
 class BridgeLayer:
     """Bridge layer connecting OKF v0.2 to external memory systems.
@@ -128,6 +139,7 @@ class BridgeLayer:
                         }
                     ]
                 },
+                timeout=LLM_TIMEOUT,
             )
 
             if response.status_code in [200, 201]:
@@ -161,11 +173,20 @@ class BridgeLayer:
             response = requests.post(
                 f"{self.hindsight_url}/v1/default/banks/kyo/memories/recall",
                 json={"query": query, "top_k": top_k},
+                timeout=LLM_TIMEOUT,
             )
 
             if response.status_code == 200:
                 data = response.json()
-                return data.get("results", data.get("memories", []))
+                results = data.get("results", data.get("memories", []))
+                # Defensive truncation. As of hindsight-api 0.9.x, this
+                # endpoint's `top_k` is silently ignored server-side: it
+                # returns every memory in the bank instead of the requested
+                # count (confirmed 2026-09-09: a 5-result request against an
+                # 81-fact bank returned all 81, correctly ranked by score but
+                # never sliced). Ranking itself is fine, so slicing here is
+                # sufficient; the real fix belongs upstream in hindsight-api.
+                return results[:top_k]
             else:
                 logger.error(
                     f"Hindsight API error: {response.status_code} - {response.text}"
@@ -191,6 +212,7 @@ class BridgeLayer:
             response = requests.post(
                 f"{self.hindsight_url}/v1/default/banks/kyo/reflect",
                 json={"query": query, "mode": "observations"},
+                timeout=LLM_TIMEOUT,
             )
 
             if response.status_code == 200:
@@ -217,6 +239,7 @@ class BridgeLayer:
             response = requests.post(
                 f"{self.hindsight_url}/v1/default/banks/kyo/consolidate",
                 json={"mode": "full"},
+                timeout=LLM_TIMEOUT,
             )
 
             if response.status_code in [200, 202]:
