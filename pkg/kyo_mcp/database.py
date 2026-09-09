@@ -32,6 +32,23 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Lightweight migration, no formal migration framework in this project:
+    # CREATE TABLE IF NOT EXISTS above is a no-op on an existing table, so a
+    # new column needs its own ALTER TABLE, guarded against re-running on a
+    # database that already has it (SQLite has no ADD COLUMN IF NOT EXISTS).
+    # These track the content hash last successfully synced to each memory
+    # system, so bridge.py can skip a resync when nothing has changed
+    # (2026-09-09: sync_to_hindsight/sync_to_mnemosyne had no such check and
+    # resynced every node on every call, and Hindsight's own dedup only
+    # merges near-identical text, so repeated non-deterministic LLM
+    # extractions of the same unchanged concept kept landing as fresh,
+    # mostly-unmerged noise instead of being recognized as repeat syncs).
+    existing_columns = {
+        row[1] for row in cursor.execute("PRAGMA table_info(knowledge_concepts)")
+    }
+    for column in ("hindsight_synced_hash", "mnemosyne_synced_hash"):
+        if column not in existing_columns:
+            cursor.execute(f"ALTER TABLE knowledge_concepts ADD COLUMN {column} TEXT")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_type ON knowledge_concepts(type)")
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_status ON knowledge_concepts(status)"
@@ -240,6 +257,40 @@ def update_node_verified(
     )
     conn.commit()
     return True
+
+
+_SYNC_HASH_COLUMNS = {
+    "hindsight": "hindsight_synced_hash",
+    "mnemosyne": "mnemosyne_synced_hash",
+}
+
+
+def get_sync_hash(
+    node_id: str, system: str, db_path: Optional[Path] = None
+) -> Optional[str]:
+    """Return the content hash last successfully synced to `system`
+    ("hindsight" or "mnemosyne") for this node, or None if it has never
+    been synced (or the node doesn't exist)."""
+    column = _SYNC_HASH_COLUMNS[system]
+    conn = get_connection(db_path)
+    row = conn.execute(
+        f"SELECT {column} FROM knowledge_concepts WHERE id = ?", (node_id,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def set_sync_hash(
+    node_id: str, system: str, content_hash: str, db_path: Optional[Path] = None
+) -> None:
+    """Record that `content_hash` is what's currently synced to `system`
+    for this node, so a future sync with the same hash can be skipped."""
+    column = _SYNC_HASH_COLUMNS[system]
+    conn = get_connection(db_path)
+    conn.execute(
+        f"UPDATE knowledge_concepts SET {column} = ? WHERE id = ?",
+        (content_hash, node_id),
+    )
+    conn.commit()
 
 
 def create_link(

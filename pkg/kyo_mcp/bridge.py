@@ -13,18 +13,30 @@ Usage:
     await bridge.trigger_consolidation()
 """
 
+import hashlib
 import logging
 import os
 from typing import Any, Dict, List, Optional
 
 from kyo_mcp.database import (
+    get_sync_hash,
     query_catalog,
+    set_sync_hash,
 )
 from kyo_mcp.okf_schema import (
     OKFConcept,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _content_hash(content: str) -> str:
+    """Hash of the exact text handed to a memory system, so a resync of an
+    unchanged concept can be recognized and skipped (2026-09-09: neither
+    sync method tracked this, so sync_all_concepts resynced every node on
+    every call regardless of whether anything had actually changed)."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
 
 # No call into Hindsight ever set a `requests` timeout, so a slow or
 # overloaded backend (confirmed 2026-09-09: a CPU-only LLM backend under
@@ -54,14 +66,25 @@ class BridgeLayer:
 
     def __init__(
         self,
-        db_path: str = "kyo.db",
+        db_path: Optional[str] = None,
         mnemosyne_config: Optional[Dict[str, Any]] = None,
         hindsight_url: Optional[str] = None,
     ):
         """Initialize the bridge layer.
 
         Args:
-            db_path: Path to the SQLite database
+            db_path: Path to the SQLite database. Defaults to None, which
+                database.py's own get_connection() resolves to the real
+                appdirs-based DB_PATH -- previously defaulted to the
+                literal string "kyo.db" here, a different (and wrong)
+                convention than the rest of the codebase uses. mcp_server.py
+                constructs BridgeLayer() with no override in three places,
+                so that mismatch silently pointed sync_all_concepts at an
+                empty database at a relative "kyo.db" path every time
+                (confirmed 2026-09-09: single-node sync tools never hit
+                this, since they never touch self.db_path, but
+                sync_all_concepts's query_catalog(db_path=self.db_path)
+                call always did).
             mnemosyne_config: Configuration for Mnemosyne integration
             hindsight_url: URL for Hindsight API. Defaults to the
                 HINDSIGHT_API_BASE_URL env var (matching
@@ -87,22 +110,44 @@ class BridgeLayer:
             # Import mnemosyne here to avoid dependency if not needed
             from mnemosyne import remember
 
-            # Convert OKF concept to Mnemosyne format
-            mnemosyne_card = {
-                "question": concept.title,
-                "answer": concept.description or "",
-                "tags": concept.tags or [],
-                "metadata": {
+            # mnemosyne.remember()'s first argument is a plain string (it
+            # calls content.encode() internally, confirmed via
+            # AttributeError: 'dict' object has no attribute 'encode' when
+            # this used to pass a whole structured dict as `content`
+            # instead). Structured fields belong in the separate
+            # `metadata` parameter.
+            content = f"{concept.title}: {concept.description or ''}"
+
+            # Skip if this exact content was already synced. Without this,
+            # sync_all_concepts resynced every node on every call, and
+            # since each resync re-runs a non-deterministic LLM extraction,
+            # Hindsight's own dedup (matched on text similarity) often
+            # didn't recognize repeats of an unchanged concept as the same
+            # thing, so noise piled up (2026-09-09: 168 of 192 facts in the
+            # kyo bank stuck at proof_count=1 after repeated test syncs).
+            new_hash = _content_hash(content)
+            if get_sync_hash(concept.id, "mnemosyne", db_path=self.db_path) == new_hash:
+                logger.info(
+                    f"Skipping {concept.id}: unchanged since last Mnemosyne sync"
+                )
+                return True
+
+            # remember() is synchronous (returns str, not a coroutine,
+            # confirmed via TypeError 2026-09-09), unlike this method's own
+            # async signature -- no await here.
+            remember(
+                content,
+                metadata={
                     "okf_id": concept.id,
                     "concept_type": concept.type,
-                    "created_at": (
-                        concept.created_at.isoformat() if concept.created_at else None
-                    ),
+                    "tags": concept.tags or [],
+                    # OKFConcept has no created_at field (confirmed via
+                    # AttributeError 2026-09-09); generated.at is the
+                    # actual ISO 8601 timestamp field, already a string.
+                    "created_at": concept.generated.at if concept.generated else None,
                 },
-            }
-
-            # Store in Mnemosyne
-            await remember(mnemosyne_card)
+            )
+            set_sync_hash(concept.id, "mnemosyne", new_hash, db_path=self.db_path)
             logger.info(f"Synced concept {concept.id} to Mnemosyne")
             return True
 
@@ -127,6 +172,15 @@ class BridgeLayer:
             if concept.tags:
                 content += f"\nTags: {', '.join(concept.tags)}"
 
+            # Skip if this exact content was already synced (see the
+            # matching check in sync_concept_to_mnemosyne for why).
+            new_hash = _content_hash(content)
+            if get_sync_hash(concept.id, "hindsight", db_path=self.db_path) == new_hash:
+                logger.info(
+                    f"Skipping {concept.id}: unchanged since last Hindsight sync"
+                )
+                return True
+
             # Send to Hindsight API
             response = requests.post(
                 f"{self.hindsight_url}/v1/default/banks/kyo/memories",
@@ -143,6 +197,7 @@ class BridgeLayer:
             )
 
             if response.status_code in [200, 201]:
+                set_sync_hash(concept.id, "hindsight", new_hash, db_path=self.db_path)
                 logger.info(f"Synced concept {concept.id} to Hindsight")
                 return True
             else:
@@ -262,8 +317,13 @@ class BridgeLayer:
             Dictionary with counts of successful/failed syncs
         """
         try:
-            # Query all concepts from the database
-            concepts = query_catalog(self.db_path)
+            # Query all concepts from the database. Must be a keyword
+            # arg: query_catalog's first positional parameter is
+            # type_filter, not db_path, so passing self.db_path
+            # positionally (confirmed 2026-09-09) filtered on
+            # type = '<the db file path string>' and silently matched
+            # zero rows every time.
+            concepts = query_catalog(db_path=self.db_path)
 
             stats = {"total": 0, "mnemosyne_success": 0, "hindsight_success": 0}
 
