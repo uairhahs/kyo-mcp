@@ -27,7 +27,10 @@ def setup_db_and_graph(tmp_path_factory):
     yield test_dir
 
     # Cleanup
-    os.environ["KYO_DATA_DIR"] = original_data_dir
+    if original_data_dir is not None:
+        os.environ["KYO_DATA_DIR"] = original_data_dir
+    elif "KYO_DATA_DIR" in os.environ:
+        del os.environ["KYO_DATA_DIR"]
     shutil.rmtree(test_dir)
 
 

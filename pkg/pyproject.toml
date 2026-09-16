@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
   "appdirs>=1.4.4",
+  "bandit>=1.9.4",
   "fastapi>=0.140.0",
   "hindsight-api>=0.9.1",
   "httptools>=0.8.0",
