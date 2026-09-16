@@ -49,6 +49,20 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
     for column in ("hindsight_synced_hash", "mnemosyne_synced_hash"):
         if column not in existing_columns:
             cursor.execute(f"ALTER TABLE knowledge_concepts ADD COLUMN {column} TEXT")
+    # Track a Hindsight retain submitted with async=true (2026-09-15: every
+    # prior sync_to_hindsight call blocked on Hindsight's full fact-extraction
+    # pipeline synchronously, which stalls for as long as the underlying LLM
+    # call takes -- confirmed to reach 45+ minutes once, well past bridge.py's
+    # own 180s requests timeout, so every such call reliably "failed" client-
+    # side regardless of whether Hindsight would have eventually succeeded.
+    # Hindsight's own /memories endpoint already supports async=true +
+    # operation_id; hindsight_operation_id/hindsight_pending_hash record what
+    # was submitted so a later check_hindsight_operation call can poll
+    # GET .../operations/{operation_id} and only promote hindsight_pending_hash
+    # to hindsight_synced_hash once Hindsight actually reports "completed".
+    for column in ("hindsight_operation_id", "hindsight_pending_hash"):
+        if column not in existing_columns:
+            cursor.execute(f"ALTER TABLE knowledge_concepts ADD COLUMN {column} TEXT")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_type ON knowledge_concepts(type)")
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_status ON knowledge_concepts(status)"
@@ -271,10 +285,12 @@ def get_sync_hash(
     """Return the content hash last successfully synced to `system`
     ("hindsight" or "mnemosyne") for this node, or None if it has never
     been synced (or the node doesn't exist)."""
+    # column is whitelisted in _SYNC_HASH_COLUMNS, cannot be user-controlled
     column = _SYNC_HASH_COLUMNS[system]
     conn = get_connection(db_path)
     row = conn.execute(
-        f"SELECT {column} FROM knowledge_concepts WHERE id = ?", (node_id,)
+        f"SELECT {column} FROM knowledge_concepts WHERE id = ?",  # nosec B608
+        (node_id,),
     ).fetchone()
     return row[0] if row else None
 
@@ -284,11 +300,63 @@ def set_sync_hash(
 ) -> None:
     """Record that `content_hash` is what's currently synced to `system`
     for this node, so a future sync with the same hash can be skipped."""
+    # column is whitelisted in _SYNC_HASH_COLUMNS, cannot be user-controlled
     column = _SYNC_HASH_COLUMNS[system]
     conn = get_connection(db_path)
     conn.execute(
-        f"UPDATE knowledge_concepts SET {column} = ? WHERE id = ?",
+        f"UPDATE knowledge_concepts SET {column} = ? WHERE id = ?",  # nosec B608
         (content_hash, node_id),
+    )
+    conn.commit()
+
+
+def get_hindsight_operation(
+    node_id: str, db_path: Optional[Path] = None
+) -> Optional[tuple[str, str]]:
+    """Return (operation_id, pending_content_hash) for an in-flight async
+    Hindsight retain submitted for this node, or None if there isn't one."""
+    conn = get_connection(db_path)
+    row = conn.execute(
+        "SELECT hindsight_operation_id, hindsight_pending_hash "
+        "FROM knowledge_concepts WHERE id = ?",
+        (node_id,),
+    ).fetchone()
+    if not row or not row[0]:
+        return None
+    return (row[0], row[1])
+
+
+def set_hindsight_operation(
+    node_id: str,
+    operation_id: str,
+    pending_hash: str,
+    db_path: Optional[Path] = None,
+) -> None:
+    """Record that `operation_id` is the in-flight async Hindsight retain
+    for this node's `pending_hash` content, so a later status check knows
+    what to poll for and what to promote to hindsight_synced_hash on
+    completion."""
+    conn = get_connection(db_path)
+    conn.execute(
+        "UPDATE knowledge_concepts "
+        "SET hindsight_operation_id = ?, hindsight_pending_hash = ? "
+        "WHERE id = ?",
+        (operation_id, pending_hash, node_id),
+    )
+    conn.commit()
+
+
+def clear_hindsight_operation(node_id: str, db_path: Optional[Path] = None) -> None:
+    """Clear a node's in-flight Hindsight operation tracking, once it's
+    resolved (completed, failed, cancelled, or found stale) -- leaving it
+    set would make every later sync_to_hindsight call think one is still
+    pending and refuse to submit a fresh one."""
+    conn = get_connection(db_path)
+    conn.execute(
+        "UPDATE knowledge_concepts "
+        "SET hindsight_operation_id = NULL, hindsight_pending_hash = NULL "
+        "WHERE id = ?",
+        (node_id,),
     )
     conn.commit()
 

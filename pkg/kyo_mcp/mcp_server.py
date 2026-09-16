@@ -247,9 +247,13 @@ async def sync_to_mnemosyne(node_id: str) -> str:
 
 @mcp.tool()
 async def sync_to_hindsight(node_id: str) -> str:
-    """Sync a knowledge node to Hindsight for fact extraction.
+    """Queue a knowledge node for Hindsight fact extraction.
 
-    This enables semantic search and reflection on the concept.
+    This submits the node asynchronously (Hindsight's own async=true
+    retain mode) and returns as soon as it's queued -- fact extraction
+    itself can take a long time on this fleet's local LLM backend, so this
+    call no longer waits for it to finish. Use check_hindsight_sync_status
+    to find out when extraction has actually completed.
     """
     try:
         r = get_concept_by_id(node_id)
@@ -262,12 +266,45 @@ async def sync_to_hindsight(node_id: str) -> str:
 
         if success:
             return (
-                f"✓ Synced {node_id} ({concept.title}) to Hindsight for fact extraction"
+                f"✓ Queued {node_id} ({concept.title}) for Hindsight fact extraction "
+                "-- check_hindsight_sync_status to see when it's done"
             )
         else:
-            return f"✗ Failed to sync {node_id} to Hindsight"
+            return f"✗ Failed to queue {node_id} for Hindsight"
     except Exception as e:
-        return f"Error syncing to Hindsight: {e}"
+        return f"Error queuing for Hindsight: {e}"
+
+
+@mcp.tool()
+async def check_hindsight_sync_status(node_id: str) -> str:
+    """Check the status of a node's Hindsight fact-extraction sync.
+
+    Call this after sync_to_hindsight to find out whether extraction has
+    actually finished, since that call itself only confirms the work was
+    queued, not completed.
+    """
+    try:
+        r = get_concept_by_id(node_id)
+        if not r:
+            return f"Error: Node {node_id} not found."
+
+        bridge = BridgeLayer()
+        result = await bridge.check_hindsight_operation(node_id)
+        state = result.get("state")
+
+        if state == "no_operation":
+            return f"No Hindsight sync currently pending for {node_id}."
+        if state == "completed":
+            return f"✓ {node_id} finished Hindsight fact extraction."
+        if state in ("pending", "processing"):
+            return f"⧗ {node_id} is still {state} in Hindsight (operation {result.get('operation_id')})."
+        if state in ("failed", "cancelled", "not_found"):
+            error = result.get("error")
+            suffix = f": {error}" if error else ""
+            return f"✗ {node_id}'s Hindsight sync ended in state '{state}'{suffix}. A fresh sync_to_hindsight call will retry."
+        return f"Error checking {node_id}'s Hindsight status: {result.get('error')}"
+    except Exception as e:
+        return f"Error checking Hindsight status: {e}"
 
 
 @mcp.tool()

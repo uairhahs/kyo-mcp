@@ -19,8 +19,11 @@ import os
 from typing import Any, Dict, List, Optional
 
 from kyo_mcp.database import (
+    clear_hindsight_operation,
+    get_hindsight_operation,
     get_sync_hash,
     query_catalog,
+    set_hindsight_operation,
     set_sync_hash,
 )
 from kyo_mcp.okf_schema import (
@@ -156,15 +159,37 @@ class BridgeLayer:
             return False
 
     async def sync_concept_to_hindsight(self, concept: OKFConcept) -> bool:
-        """Sync an OKF concept to Hindsight for fact extraction.
+        """Submit an OKF concept to Hindsight for fact extraction.
+
+        2026-09-15: this used to POST with Hindsight's default async=false,
+        blocking on the full extraction pipeline synchronously. Confirmed
+        via the-fleet-host's SYCL inference backend that a single retain call can
+        legitimately take 45+ minutes (a prompt-processing regression on
+        the LLM side, tracked separately) -- well past this method's own
+        LLM_TIMEOUT, so the `requests.post()` reliably raised a client-side
+        timeout and every such call was reported as "failed" regardless of
+        whether Hindsight would have eventually finished it. Hindsight's own
+        /memories endpoint already supports `async=true` + a client-supplied
+        `operation_id` (idempotent: resubmitting the same id against
+        unchanged content returns the existing operation rather than
+        enqueuing a duplicate) plus a GET .../operations/{operation_id} to
+        poll status -- see check_hindsight_operation below. Submission with
+        async=true returns as soon as Hindsight has enqueued the work, so
+        this call is now fast regardless of how long extraction itself
+        takes; the underlying LLM call is no longer this method's problem.
 
         Args:
             concept: The OKF concept to sync
 
         Returns:
-            True if sync was successful, False otherwise
+            True if the submission was accepted (queued or already
+            in-flight/complete), False if the submission itself failed.
+            This does NOT mean extraction has finished -- call
+            check_hindsight_operation to find out when it has.
         """
         try:
+            import uuid
+
             import requests
 
             # Prepare content for Hindsight
@@ -181,7 +206,31 @@ class BridgeLayer:
                 )
                 return True
 
-            # Send to Hindsight API
+            # Skip if there's already an in-flight submission for this exact
+            # content -- otherwise every retry before the first one resolves
+            # would submit a fresh operation_id (since it's derived from
+            # new_hash below, a *stale* one wouldn't collide, just duplicate
+            # the work).
+            existing = get_hindsight_operation(concept.id, db_path=self.db_path)
+            if existing and existing[1] == new_hash:
+                logger.info(
+                    f"Skipping {concept.id}: operation {existing[0]} already "
+                    "in flight for this content -- use check_hindsight_operation"
+                )
+                return True
+
+            # Deterministic, not random: resubmitting the same content for
+            # the same node after a lost/ambiguous response (e.g. this
+            # process died after Hindsight accepted the request but before
+            # it recorded the operation_id locally) reuses the same id.
+            # Hindsight treats that as "return the existing operation," not
+            # a duplicate -- reusing an id against genuinely *different*
+            # content would instead get HTTP 409, which is exactly why this
+            # is derived from new_hash rather than concept.id alone.
+            operation_id = str(
+                uuid.uuid5(uuid.NAMESPACE_URL, f"kyo-hindsight:{concept.id}:{new_hash}")
+            )
+
             response = requests.post(
                 f"{self.hindsight_url}/v1/default/banks/kyo/memories",
                 json={
@@ -191,14 +240,20 @@ class BridgeLayer:
                             "tags": concept.tags or [],
                             "importance": 5,
                         }
-                    ]
+                    ],
+                    "async": True,
+                    "operation_id": operation_id,
                 },
                 timeout=LLM_TIMEOUT,
             )
 
             if response.status_code in [200, 201]:
-                set_sync_hash(concept.id, "hindsight", new_hash, db_path=self.db_path)
-                logger.info(f"Synced concept {concept.id} to Hindsight")
+                set_hindsight_operation(
+                    concept.id, operation_id, new_hash, db_path=self.db_path
+                )
+                logger.info(
+                    f"Queued concept {concept.id} to Hindsight as operation {operation_id}"
+                )
                 return True
             else:
                 logger.error(
@@ -207,8 +262,75 @@ class BridgeLayer:
                 return False
 
         except Exception as e:
-            logger.error(f"Failed to sync concept {concept.id} to Hindsight: {e}")
+            logger.error(f"Failed to submit concept {concept.id} to Hindsight: {e}")
             return False
+
+    async def check_hindsight_operation(self, node_id: str) -> Dict[str, Any]:
+        """Poll the status of a node's in-flight Hindsight sync operation.
+
+        Returns a dict with at least a "state" key:
+          - "no_operation": nothing pending (never submitted, or the last
+            submission already completed/failed and was cleared).
+          - "pending" / "processing": still queued or running in Hindsight.
+          - "completed": extraction finished; hindsight_synced_hash has
+            been promoted so a future sync_concept_to_hindsight call with
+            the same content will skip as already-synced.
+          - "failed" / "cancelled": extraction did not succeed; the pending
+            operation has been cleared so a fresh sync_concept_to_hindsight
+            call will submit a new attempt. "error" holds Hindsight's own
+            error_message when present.
+          - "not_found": Hindsight has no record of this operation_id (e.g.
+            it was deleted server-side); cleared locally for the same
+            reason as failed/cancelled.
+          - "error": the status check itself failed (network error, bad
+            response) -- the pending operation is left untouched so a later
+            check can retry.
+        """
+        pending = get_hindsight_operation(node_id, db_path=self.db_path)
+        if not pending:
+            return {"state": "no_operation"}
+        operation_id, pending_hash = pending
+
+        try:
+            import requests
+
+            response = requests.get(
+                f"{self.hindsight_url}/v1/default/banks/kyo/operations/{operation_id}",
+                timeout=30,
+            )
+            if response.status_code != 200:
+                return {
+                    "state": "error",
+                    "error": f"HTTP {response.status_code}: {response.text}",
+                }
+            body = response.json()
+            status = body.get("status")
+
+            if status == "completed":
+                set_sync_hash(node_id, "hindsight", pending_hash, db_path=self.db_path)
+                clear_hindsight_operation(node_id, db_path=self.db_path)
+                logger.info(
+                    f"Hindsight operation {operation_id} for {node_id} completed"
+                )
+                return {"state": "completed", "operation_id": operation_id}
+
+            if status in ("failed", "cancelled", "not_found"):
+                clear_hindsight_operation(node_id, db_path=self.db_path)
+                logger.warning(
+                    f"Hindsight operation {operation_id} for {node_id}: {status}"
+                )
+                return {
+                    "state": status,
+                    "operation_id": operation_id,
+                    "error": body.get("error_message"),
+                }
+
+            # pending / processing: leave tracking state as-is
+            return {"state": status, "operation_id": operation_id}
+
+        except Exception as e:
+            logger.error(f"Failed to check Hindsight operation {operation_id}: {e}")
+            return {"state": "error", "error": str(e)}
 
     async def recall_from_hindsight(
         self, query: str, top_k: int = 5
