@@ -31,6 +31,22 @@ HAS_LLM = (
 )
 
 
+def _hindsight_reachable() -> bool:
+    """Probe Hindsight with a short timeout so a missing backend skips this
+    module in seconds instead of burning HTTP_TIMEOUT/LLM_TIMEOUT per test."""
+    try:
+        requests.get(f"{HINDSIGHT_BASE_URL}/health", timeout=3)
+        return True
+    except requests.exceptions.RequestException:
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _hindsight_reachable(),
+    reason=f"Hindsight not reachable at {HINDSIGHT_BASE_URL}",
+)
+
+
 class TestHindsightConnection:
     """Test Hindsight API connection."""
 
