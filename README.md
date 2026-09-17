@@ -8,8 +8,7 @@ Kyo (経) is a knowledge graph MCP server that implements Google's Open Knowledg
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                     MCP Client                      │
-│                    (MCP Client)                          │
+│                       MCP Client                          │
 └──────────────────────┬──────────────────────────────────┘
                        │ stdio / streamable-http
                        ▼
@@ -33,7 +32,7 @@ Kyo (経) is a knowledge graph MCP server that implements Google's Open Knowledg
 - **OKF v0.2 Compliance** — Structured knowledge concepts with trust signals, provenance, and freshness metadata
 - **MCP 2026-07-28** — Stateless protocol, MRTR, Streamable HTTP transport
 - **Mnemosyne Integration** — Spaced repetition for long-term knowledge retention
-- **Hindsight Integration** — AI-powered fact extraction and semantic search via local LLM (Ornith-9B on the-hindsight-host)
+- **Hindsight Integration** — AI-powered fact extraction and semantic search via a local LLM
 - **Ontology Layer** — SKOS/Dublin Core mappings with Turtle RDF export
 - **SQLite + NetworkX** — Lightweight graph storage without external dependencies
 

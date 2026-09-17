@@ -9,7 +9,7 @@ Commands:
     search_concepts <query> [--limit N]
     get_concept <concept_id>
     create_concept <label> <summary> [--content TEXT]
-    create_link <source_id> <target_id> <link_type> [--weight N]
+    create_link <source_id> <target_id> <link_type>
     query_catalog <query> [--limit N] [--verified-only]
     sync_to_mnemosyne <concept_id>
     sync_to_hindsight <concept_id>
@@ -39,8 +39,7 @@ from kyo_mcp.database import (
 def cmd_search_concepts(args: argparse.Namespace) -> str:
     """Search concepts by query."""
     query = " ".join(args.query) if args.query else ""
-    db_path = Path("/path/to/kyo/pkg/kyo_catalog.db")
-    results = query_catalog(search_term=query, db_path=db_path)
+    results = query_catalog(search_term=query)
     # Apply limit if specified
     if args.limit and args.limit > 0:
         results = results[: args.limit]
@@ -49,8 +48,7 @@ def cmd_search_concepts(args: argparse.Namespace) -> str:
 
 def cmd_get_concept(args: argparse.Namespace) -> str:
     """Get concept by ID."""
-    db_path = Path("/path/to/kyo/pkg/kyo_catalog.db")
-    concept = get_concept_by_id(args.concept_id, db_path=db_path)
+    concept = get_concept_by_id(args.concept_id)
     if concept:
         return json.dumps(concept, default=str)
     else:
@@ -59,7 +57,6 @@ def cmd_get_concept(args: argparse.Namespace) -> str:
 
 def cmd_create_concept(args: argparse.Namespace) -> str:
     """Create a new concept."""
-    db_path = Path("/path/to/kyo/pkg/kyo_catalog.db")
     import time
 
     concept_dict = {
@@ -75,33 +72,28 @@ def cmd_create_concept(args: argparse.Namespace) -> str:
             }
         ],
     }
-    create_concept(concept_dict, markdown_body=args.content or "", db_path=db_path)
+    create_concept(concept_dict, markdown_body=args.content or "")
     return json.dumps({"created": True, "concept_id": concept_dict["id"]})
 
 
 def cmd_create_link(args: argparse.Namespace) -> str:
     """Create a link between concepts."""
-    db_path = Path("/path/to/kyo/pkg/kyo_catalog.db")
-    conn = get_connection(db_path)
-    result = create_link(
-        conn,
-        source_id=args.source_id,
-        target_id=args.target_id,
-        link_type=args.link_type,
-        weight=args.weight,
+    create_link(args.source_id, args.target_id, args.link_type)
+    return json.dumps(
+        {
+            "created": True,
+            "source_id": args.source_id,
+            "target_id": args.target_id,
+            "link_type": args.link_type,
+        }
     )
-    return json.dumps({"created": True, "link_id": result.id})
 
 
 def cmd_query_catalog(args: argparse.Namespace) -> str:
     """Query the catalog."""
     query = " ".join(args.query) if args.query else ""
-    db_path = Path("/path/to/kyo/pkg/kyo_catalog.db")
-    get_connection(db_path)
-    results = query_catalog(
-        search_term=query,
-        db_path=db_path,
-    )
+    get_connection()
+    results = query_catalog(search_term=query)
     # Apply filters
     if args.verified_only:
         results = [r for r in results if r.get("verified")]
@@ -115,14 +107,13 @@ async def cmd_sync_to_mnemosyne(args: argparse.Namespace) -> str:
     try:
         from kyo_mcp.database import get_concept_by_id
 
-        db_path = Path("/path/to/kyo/pkg/kyo_catalog.db")
-        concept_data = get_concept_by_id(args.concept_id, db_path=db_path)
+        concept_data = get_concept_by_id(args.concept_id)
         if not concept_data:
             return json.dumps({"error": f"Concept {args.concept_id} not found"})
         from kyo_mcp.okf_schema import OKFConcept
 
         concept = OKFConcept.model_validate(concept_data)
-        bridge = BridgeLayer(db_path=str(db_path))
+        bridge = BridgeLayer()
         result = await bridge.sync_concept_to_mnemosyne(concept)
         return json.dumps({"success": result})
     except Exception as e:
@@ -134,8 +125,7 @@ async def cmd_sync_to_hindsight(args: argparse.Namespace) -> str:
     try:
         from kyo_mcp.database import get_concept_by_id
 
-        db_path = Path("/path/to/kyo/pkg/kyo_catalog.db")
-        concept_data = get_concept_by_id(args.concept_id, db_path=db_path)
+        concept_data = get_concept_by_id(args.concept_id)
         if not concept_data:
             return json.dumps({"error": f"Concept {args.concept_id} not found"})
         # Parse metadata if it's a string
@@ -147,7 +137,7 @@ async def cmd_sync_to_hindsight(args: argparse.Namespace) -> str:
         from kyo_mcp.okf_schema import OKFConcept
 
         concept = OKFConcept.model_validate(concept_data)
-        bridge = BridgeLayer(db_path=str(db_path))
+        bridge = BridgeLayer()
         result = await bridge.sync_concept_to_hindsight(concept)
         return json.dumps({"success": result})
     except Exception as e:
@@ -168,8 +158,7 @@ async def cmd_recall_from_hindsight(args: argparse.Namespace) -> str:
 async def cmd_sync_all(args: argparse.Namespace) -> str:
     """Sync all concepts."""
     try:
-        db_path = Path("/path/to/kyo/pkg/kyo_catalog.db")
-        bridge = BridgeLayer(db_path=str(db_path))
+        bridge = BridgeLayer()
         result = await bridge.sync_all_concepts()
         return json.dumps(result, default=str)
     except Exception as e:
@@ -212,7 +201,6 @@ async def main():
     p_link.add_argument("source_id", type=str)
     p_link.add_argument("target_id", type=str)
     p_link.add_argument("link_type", type=str)
-    p_link.add_argument("--weight", type=float, default=None)
 
     # query_catalog
     p_query = subparsers.add_parser("query_catalog")

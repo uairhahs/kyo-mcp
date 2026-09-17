@@ -7,7 +7,6 @@ A knowledge graph MCP server implementing the [Open Knowledge Format (OKF) v0.2]
 ```text
 ┌─────────────────────────────────────────────────────────┐
 │                     MCP Client                           │
-│              (Pi, Claude Desktop, etc.)                  │
 └──────────────────────┬──────────────────────────────────┘
                        │ stdio / streamable-http
                        ▼
@@ -44,11 +43,11 @@ uv run python -m kyo_mcp.mcp_server --transport sse --port 8000
 
 ## Transport Options
 
-| Transport         | Use Case                    | Command                                                                       |
-| ----------------- | --------------------------- | ----------------------------------------------------------------------------- |
-| `stdio`           | Local development, Pi agent | `uv run python -m kyo_mcp.mcp_server`                                         |
-| `streamable-http` | Remote access, production   | `uv run python -m kyo_mcp.mcp_server --transport streamable-http --port 8000` |
-| `sse`             | Server-Sent Events          | `uv run python -m kyo_mcp.mcp_server --transport sse --port 8000`             |
+| Transport         | Use Case                  | Command                                                                       |
+| ----------------- | ------------------------- | ----------------------------------------------------------------------------- |
+| `stdio`           | Local development         | `uv run python -m kyo_mcp.mcp_server`                                         |
+| `streamable-http` | Remote access, production | `uv run python -m kyo_mcp.mcp_server --transport streamable-http --port 8000` |
+| `sse`             | Server-Sent Events        | `uv run python -m kyo_mcp.mcp_server --transport sse --port 8000`             |
 
 ## MCP Tools
 
@@ -108,20 +107,10 @@ trunk check --fix
 
 ## Integration
 
-### MCP Client
-
-Configure in `~/.mcp-client/settings.json`:
-
-```json
-{
-  "transport": "auto",
-  "command": "cd /path/to/kyo/pkg && uv run python -m kyo_mcp.mcp_server"
-}
-```
-
 ### Hindsight
 
-Running on `localhost:8888` (API) and `localhost:9999` (UI) for semantic search and reflection.
+Runs on `localhost:8888` (API) and `localhost:9999` (UI) by default for semantic search and
+reflection. Set `HINDSIGHT_API_BASE_URL` if it's deployed elsewhere.
 
 ## License
 

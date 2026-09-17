@@ -1,4 +1,6 @@
-# ~/Projects/kyo/modules/services/kyo.nix
+# NixOS module for the Kyo Knowledge Catalogue MCP Server.
+# Import this file into your NixOS configuration and set
+# services.kyo.enable = true; to run it as a systemd service.
 { config, lib, pkgs, ... }:
 
 let
@@ -40,11 +42,6 @@ in {
     };
   };
 
-  config.lib.hosts.the-fleet-host = lib.mkIf cfg.enable ''
-    # Add this to your the-fleet-host/nixos-config hosts/the-fleet-host/default.nix:
-    imports = [ "${config.suffixes.services.kyo}/modules/services/kyo.nix" ];
-  '';
-
   config = lib.mkIf cfg.enable {
     # Ensure a dedicated user for the service
     users.users.kyo = {
@@ -56,12 +53,26 @@ in {
 
     users.groups.kyo = {};
 
-    # Define the systemd service
-    preStart = ''
+    systemd.services.kyo = {
+      description = "Kyo Knowledge Catalogue MCP Server";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "network.target" ];
+
+      preStart = ''
         if [ ! -f /var/lib/kyo/kyo_catalog.db ]; then
           cp ${../../pkg/kyo_catalog.db} /var/lib/kyo/kyo_catalog.db
           chmod 644 /var/lib/kyo/kyo_catalog.db
         fi
       '';
+
+      serviceConfig = {
+        User = "kyo";
+        Group = "kyo";
+        WorkingDirectory = "/var/lib/kyo";
+        ExecStart = "${kyoPackage}/bin/kyo-mcp";
+        EnvironmentFile = lib.mkIf (cfg.environmentFile != null) cfg.environmentFile;
+        Restart = "on-failure";
+      };
+    };
   };
 }

@@ -5,6 +5,7 @@
 # local files
 .local
 AGENTS.md
+.vscode/
 
 .venv/
 __pycache__/
