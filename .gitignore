@@ -5,6 +5,7 @@
 # local files
 .local
 AGENTS.md
+.claude
 .vscode/
 
 .venv/

@@ -1,6 +1,8 @@
 """Tests for Hindsight integration with OKF v0.2."""
 
 import os
+import time
+import uuid
 
 import pytest
 import requests
@@ -15,12 +17,74 @@ TEST_BANK_ID = "kyo-test"
 # None of these calls used to set a requests timeout, so a slow or
 # overloaded Hindsight backend hung the whole test run indefinitely instead
 # of failing (confirmed 2026-09-09 against a CPU-only LLM backend under
-# concurrent load). HTTP_TIMEOUT covers plain reads; LLM_TIMEOUT covers
-# anything that touches Hindsight's extraction/reflection/consolidation
-# pipeline and is generous on purpose, since CPU-only prompt processing on
-# a large context can legitimately take well over a minute.
+# concurrent load). HTTP_TIMEOUT covers plain reads; LLM_TIMEOUT covers a
+# single synchronous LLM-backed request/response cycle (recall/reflect/
+# consolidate) and is generous on purpose, since CPU-only prompt processing
+# on a large context can legitimately take well over a minute.
 HTTP_TIMEOUT = 30
 LLM_TIMEOUT = 180
+
+# A queued retain operation (async store) is a separate budget from
+# LLM_TIMEOUT: confirmed against a CPU-only backend that prompt eval alone
+# can take well over a minute before generation even starts, and retain's
+# own generation has no output-token cap -- observed running past several
+# thousand tokens with no sign of stopping in one real case. 180s was not
+# enough for a real store to reach "completed" against a backend like that
+# (confirmed: tests that waited for completion failed on timeout, not on a
+# wrong result), so this is deliberately much larger.
+OPERATION_TIMEOUT = 900
+
+
+def _store_memory(content, tags=None, importance=5, bank_id=TEST_BANK_ID):
+    """Submit a memory with async=True, matching bridge.py's
+    sync_concept_to_hindsight. A synchronous (async=False) store blocks on
+    the full retain/extraction pipeline, which has no output-token cap on
+    the LLM side -- confirmed directly against a real backend, where a
+    single retain call's generation ran past 470+ tokens with no sign of
+    stopping. async=True returns as soon as the item is enqueued,
+    regardless of how long extraction itself takes.
+    """
+    operation_id = str(uuid.uuid4())
+    item = {"content": content, "importance": importance}
+    if tags:
+        item["tags"] = tags
+    response = requests.post(
+        f"{HINDSIGHT_BASE_URL}/v1/default/banks/{bank_id}/memories",
+        json={"items": [item], "async": True, "operation_id": operation_id},
+        timeout=HTTP_TIMEOUT,
+    )
+    return response, operation_id
+
+
+def _wait_for_operation(
+    operation_id, bank_id=TEST_BANK_ID, timeout=OPERATION_TIMEOUT, poll_interval=2
+):
+    """Poll .../operations/{operation_id} (the same endpoint
+    check_hindsight_operation in bridge.py polls) until it reaches a
+    terminal status or the timeout elapses. Bounded, unlike blocking on the
+    store call itself -- a slow backend fails this with a clear assertion
+    instead of hanging the whole test run."""
+    deadline = time.monotonic() + timeout
+    status = None
+    while time.monotonic() < deadline:
+        response = requests.get(
+            f"{HINDSIGHT_BASE_URL}/v1/default/banks/{bank_id}/operations/{operation_id}",
+            timeout=HTTP_TIMEOUT,
+        )
+        if response.status_code != 200:
+            pytest.fail(
+                f"Operation status request failed with HTTP {response.status_code}: "
+                f"{response.text}"
+            )
+        status = response.json().get("status")
+        if status in ("completed", "failed", "cancelled", "not_found"):
+            return status
+        time.sleep(poll_interval)
+    pytest.fail(
+        f"Hindsight operation {operation_id} did not reach a terminal status "
+        f"within {timeout}s (last status: {status})"
+    )
+
 
 # Check if LLM is available (for fact extraction and reflection)
 # In 'none' mode, we can store/recall but not reflect
@@ -53,27 +117,44 @@ class TestHindsightConnection:
     def test_api_health(self):
         """Test that Hindsight API is healthy."""
         response = requests.get(f"{HINDSIGHT_BASE_URL}/health", timeout=HTTP_TIMEOUT)
-        assert response.status_code == 200
+        if response.status_code != 200:
+            pytest.fail(
+                f"Operation status request failed with HTTP {response.status_code}: "
+                f"{response.text}"
+            )
         data = response.json()
-        assert data["status"] == "healthy"
-        assert data["database"] == "connected"
+        if data.get("status") != "healthy":
+            pytest.fail(f"Expected a healthy Hindsight API, got: {data}")
+        if data.get("database") != "connected":
+            pytest.fail(f"Expected a connected Hindsight database, got: {data}")
 
     def test_api_version(self):
         """Test that we can get API version."""
         response = requests.get(f"{HINDSIGHT_BASE_URL}/version", timeout=HTTP_TIMEOUT)
-        assert response.status_code == 200
+        if response.status_code != 200:
+            pytest.fail(
+                f"Operation status request failed with HTTP {response.status_code}: "
+                f"{response.text}"
+            )
         data = response.json()
-        assert "api_version" in data or "version" in data
+        if "api_version" not in data and "version" not in data:
+            pytest.fail("Response does not contain an 'api_version' or 'version' field")
 
     def test_list_banks(self):
         """Test listing banks."""
         response = requests.get(
             f"{HINDSIGHT_BASE_URL}/v1/default/banks", timeout=HTTP_TIMEOUT
         )
-        assert response.status_code == 200
+        if response.status_code != 200:
+            pytest.fail(
+                f"Operation status request failed with HTTP {response.status_code}: "
+                f"{response.text}"
+            )
         data = response.json()
-        assert "banks" in data
-        assert isinstance(data["banks"], list)
+        if "banks" not in data:
+            pytest.fail("Response does not contain a 'banks' field")
+        if not isinstance(data["banks"], list):
+            pytest.fail("Response 'banks' field is not a list")
 
 
 class TestHindsightMemoryOperations:
@@ -83,33 +164,41 @@ class TestHindsightMemoryOperations:
         """Setup test bank."""
         # Banks are created automatically on first memory store
         # We'll create one by storing a test memory
-        response = requests.post(
-            f"{HINDSIGHT_BASE_URL}/v1/default/banks/{TEST_BANK_ID}/memories",
-            json={"items": [{"content": "Test setup memory", "importance": 1}]},
-            timeout=LLM_TIMEOUT,
-        )
-        assert response.status_code in [200, 201]
+        response, _ = _store_memory("Test setup memory", importance=1)
+        if response.status_code not in [200, 201]:
+            pytest.fail(
+                f"Operation status request failed with HTTP {response.status_code}: "
+                f"{response.text}"
+            )
 
     def test_store_memory(self):
-        """Test storing a memory."""
-        response = requests.post(
-            f"{HINDSIGHT_BASE_URL}/v1/default/banks/{TEST_BANK_ID}/memories",
-            json={
-                "items": [
-                    {"content": "Test memory for Kyo integration", "importance": 5}
-                ]
-            },
-            timeout=LLM_TIMEOUT,
-        )
-        assert response.status_code in [200, 201]
+        """Test storing a memory. Only checks that the item was accepted
+        (matching the original, pre-async test's own scope) -- not that
+        extraction has finished. Waiting for completion here would
+        reintroduce the same long block that switching to async=True was
+        meant to remove; see test_recall_memory below for a case that
+        genuinely needs to wait."""
+        response, _ = _store_memory("Test memory for Kyo integration")
+        if response.status_code not in [200, 201]:
+            pytest.fail(
+                f"Operation status request failed with HTTP {response.status_code}: "
+                f"{response.text}"
+            )
         data = response.json()
-        assert data.get("success") is True or "bank_id" in data
+        if not (data.get("success") is True or "bank_id" in data):
+            raise AssertionError("Memory store response did not indicate success")
 
     @pytest.mark.skipif(not HAS_LLM, reason="Requires LLM for semantic search")
     def test_recall_memory(self):
         """Test recalling memories."""
-        # First store a memory
-        self.test_store_memory()
+        # Store a memory and wait for extraction, since recall searches
+        # over extracted facts, not the raw submitted item.
+        _, operation_id = _store_memory("Test memory for Kyo integration")
+        operation_status = _wait_for_operation(operation_id)
+        if operation_status != "completed":
+            pytest.fail(
+                f"Memory extraction operation ended with status: {operation_status}"
+            )
 
         # Then recall
         response = requests.post(
@@ -117,9 +206,14 @@ class TestHindsightMemoryOperations:
             json={"query": "test memory", "top_k": 5},
             timeout=LLM_TIMEOUT,
         )
-        assert response.status_code == 200
+        if response.status_code != 200:
+            pytest.fail(
+                f"Operation status request failed with HTTP {response.status_code}: "
+                f"{response.text}"
+            )
         data = response.json()
-        assert "results" in data or "memories" in data
+        if "results" not in data and "memories" not in data:
+            pytest.fail("Recall response contains neither results nor memories")
 
     def test_list_memories(self):
         """Test listing memories."""
@@ -132,9 +226,14 @@ class TestHindsightMemoryOperations:
             params={"limit": 10},
             timeout=HTTP_TIMEOUT,
         )
-        assert response.status_code == 200
+        if response.status_code != 200:
+            pytest.fail(
+                f"Operation status request failed with HTTP {response.status_code}: "
+                f"{response.text}"
+            )
         data = response.json()
-        assert isinstance(data, dict)  # Just verify we get a response
+        if not isinstance(data, dict):
+            pytest.fail("Expected the memories list response to be a JSON object")
 
 
 @pytest.mark.skipif(not HAS_LLM, reason="Requires LLM for reflection")
@@ -144,23 +243,17 @@ class TestHindsightReflection:
     def setup_method(self):
         """Setup test bank with memories."""
         # Create bank by storing first memory
-        requests.post(
-            f"{HINDSIGHT_BASE_URL}/v1/default/banks/{TEST_BANK_ID}/memories",
-            json={"items": [{"content": "Setup memory", "importance": 1}]},
-            timeout=LLM_TIMEOUT,
-        )
+        _, setup_op = _store_memory("Setup memory", importance=1)
 
         # Store some memories
+        operation_ids = [setup_op]
         for i in range(3):
-            requests.post(
-                f"{HINDSIGHT_BASE_URL}/v1/default/banks/{TEST_BANK_ID}/memories",
-                json={
-                    "items": [
-                        {"content": f"Test memory {i} for reflection", "importance": 3}
-                    ]
-                },
-                timeout=LLM_TIMEOUT,
+            _, operation_id = _store_memory(
+                f"Test memory {i} for reflection", importance=3
             )
+            operation_ids.append(operation_id)
+        for operation_id in operation_ids:
+            _wait_for_operation(operation_id)
 
     def test_reflect(self):
         """Test triggering reflection."""
@@ -172,9 +265,14 @@ class TestHindsightReflection:
             },
             timeout=LLM_TIMEOUT,
         )
-        assert response.status_code == 200
+        if response.status_code != 200:
+            pytest.fail(
+                f"Operation status request failed with HTTP {response.status_code}: "
+                f"{response.text}"
+            )
         data = response.json()
-        assert "observations" in data or "results" in data
+        if "observations" not in data and "results" not in data:
+            pytest.fail("Reflection response contains neither observations nor results")
 
 
 class TestOKFHindsightSync:
@@ -183,12 +281,11 @@ class TestOKFHindsightSync:
     def setup_method(self):
         """Setup test bank."""
         # Create bank by storing first memory
-        response = requests.post(
-            f"{HINDSIGHT_BASE_URL}/v1/default/banks/{TEST_BANK_ID}/memories",
-            json={"items": [{"content": "Setup memory", "importance": 1}]},
-            timeout=LLM_TIMEOUT,
-        )
-        assert response.status_code in [200, 201]
+        response, _ = _store_memory("Setup memory", importance=1)
+        if response.status_code not in [200, 201]:
+            pytest.fail(
+                f"Failed to create test bank with HTTP {response.status_code}: {response.text}"
+            )
 
     def test_sync_concept_to_hindsight(self):
         """Test syncing an OKF concept to Hindsight."""
@@ -201,12 +298,11 @@ class TestOKFHindsightSync:
 
         # Sync to Hindsight
         content = f"{concept.title}: {concept.description}"
-        response = requests.post(
-            f"{HINDSIGHT_BASE_URL}/v1/default/banks/{TEST_BANK_ID}/memories",
-            json={"items": [{"content": content, "importance": 5}]},
-            timeout=LLM_TIMEOUT,
-        )
-        assert response.status_code in [200, 201]
+        response, _ = _store_memory(content)
+        if response.status_code not in [200, 201]:
+            pytest.fail(
+                f"Failed to sync concept to Hindsight with HTTP {response.status_code}: {response.text}"
+            )
 
     def test_sync_concept_with_context(self):
         """Test syncing an OKF concept with context."""
@@ -220,13 +316,11 @@ class TestOKFHindsightSync:
 
         # Sync with context
         content = f"{concept.title}: {concept.description}"
-        tags = concept.tags
-        response = requests.post(
-            f"{HINDSIGHT_BASE_URL}/v1/default/banks/{TEST_BANK_ID}/memories",
-            json={"items": [{"content": content, "tags": tags, "importance": 5}]},
-            timeout=LLM_TIMEOUT,
-        )
-        assert response.status_code in [200, 201]
+        response, _ = _store_memory(content, tags=concept.tags)
+        if response.status_code not in [200, 201]:
+            pytest.fail(
+                f"Failed to sync concept with context to Hindsight with HTTP {response.status_code}: {response.text}"
+            )
 
 
 @pytest.mark.skipif(not HAS_LLM, reason="Requires LLM for consolidation")
@@ -236,26 +330,17 @@ class TestHindsightConsolidation:
     def setup_method(self):
         """Setup test bank with memories."""
         # Create bank by storing first memory
-        requests.post(
-            f"{HINDSIGHT_BASE_URL}/v1/default/banks/{TEST_BANK_ID}/memories",
-            json={"items": [{"content": "Setup memory", "importance": 1}]},
-            timeout=LLM_TIMEOUT,
-        )
+        _, setup_op = _store_memory("Setup memory", importance=1)
 
         # Store some memories
+        operation_ids = [setup_op]
         for i in range(5):
-            requests.post(
-                f"{HINDSIGHT_BASE_URL}/v1/default/banks/{TEST_BANK_ID}/memories",
-                json={
-                    "items": [
-                        {
-                            "content": f"Test memory {i} for consolidation",
-                            "importance": 3,
-                        }
-                    ]
-                },
-                timeout=LLM_TIMEOUT,
+            _, operation_id = _store_memory(
+                f"Test memory {i} for consolidation", importance=3
             )
+            operation_ids.append(operation_id)
+        for operation_id in operation_ids:
+            _wait_for_operation(operation_id)
 
     def test_consolidate(self):
         """Test triggering consolidation."""
@@ -265,4 +350,7 @@ class TestHindsightConsolidation:
             timeout=LLM_TIMEOUT,
         )
         # Consolidation may be async, so we just check it starts
-        assert response.status_code in [200, 202]
+        if response.status_code not in [200, 202]:
+            pytest.fail(
+                f"Failed to trigger consolidation with HTTP {response.status_code}: {response.text}"
+            )
