@@ -70,6 +70,7 @@ class BridgeLayer:
         db_path: Optional[str] = None,
         mnemosyne_config: Optional[Dict[str, Any]] = None,
         hindsight_url: Optional[str] = None,
+        hindsight_api_key: Optional[str] = None,
     ):
         """Initialize the bridge layer.
 
@@ -88,12 +89,32 @@ class BridgeLayer:
                 HINDSIGHT_API_BASE_URL env var (matching
                 tests/test_hindsight_integration.py), then
                 http://localhost:8888.
+            hindsight_api_key: Bearer token for a hosted Hindsight instance
+                (e.g. Hindsight Cloud) that requires authentication.
+                Defaults to the HINDSIGHT_API_KEY env var, then None. A
+                self-hosted Hindsight has no auth of its own -- when this
+                is None, no Authorization header is sent at all, matching
+                every request this class made before this option existed.
         """
         self.db_path = db_path
         self.mnemosyne_config = mnemosyne_config or {}
         self.hindsight_url = hindsight_url or os.environ.get(
             "HINDSIGHT_API_BASE_URL", "http://localhost:8888"
         )
+        self.hindsight_api_key = hindsight_api_key or os.environ.get(
+            "HINDSIGHT_API_KEY"
+        )
+
+    def _hindsight_headers(self) -> Dict[str, str]:
+        """Auth header for a hosted Hindsight instance. Hindsight Cloud
+        (api.hindsight.vectorize.io) requires `Authorization: Bearer
+        <key>`; self-hosted Hindsight declares no security scheme at all
+        in its own OpenAPI spec, so when no key is configured this returns
+        an empty dict and every call sends no Authorization header,
+        unchanged from before this option existed."""
+        if self.hindsight_api_key:
+            return {"Authorization": f"Bearer {self.hindsight_api_key}"}
+        return {}
 
     async def sync_concept_to_mnemosyne(self, concept: OKFConcept) -> bool:
         """Sync an OKF concept to Mnemosyne for spaced repetition.
@@ -233,6 +254,7 @@ class BridgeLayer:
                     "async": True,
                     "operation_id": operation_id,
                 },
+                headers=self._hindsight_headers(),
                 timeout=LLM_TIMEOUT,
             )
 
@@ -285,6 +307,7 @@ class BridgeLayer:
 
             response = requests.get(
                 f"{self.hindsight_url}/v1/default/banks/kyo/operations/{operation_id}",
+                headers=self._hindsight_headers(),
                 timeout=30,
             )
             if response.status_code != 200:
@@ -339,6 +362,7 @@ class BridgeLayer:
             response = requests.post(
                 f"{self.hindsight_url}/v1/default/banks/kyo/memories/recall",
                 json={"query": query, "top_k": top_k},
+                headers=self._hindsight_headers(),
                 timeout=LLM_TIMEOUT,
             )
 
@@ -377,6 +401,7 @@ class BridgeLayer:
             response = requests.post(
                 f"{self.hindsight_url}/v1/default/banks/kyo/reflect",
                 json={"query": query, "mode": "observations"},
+                headers=self._hindsight_headers(),
                 timeout=LLM_TIMEOUT,
             )
 
@@ -404,6 +429,7 @@ class BridgeLayer:
             response = requests.post(
                 f"{self.hindsight_url}/v1/default/banks/kyo/consolidate",
                 json={"mode": "full"},
+                headers=self._hindsight_headers(),
                 timeout=LLM_TIMEOUT,
             )
 

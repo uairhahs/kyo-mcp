@@ -102,14 +102,17 @@ kyo/
 - `mcp>=2.0.0` — MCP SDK with Streamable HTTP support
 - `networkx>=3.0` — Graph algorithms
 - `mnemosyne-memory>=3.0` — Spaced repetition
-- `hindsight-api>=0.9.0` — AI fact extraction
 - `pydantic>=2.0` — Data validation
+
+Talking to Hindsight itself is done with plain HTTP (`requests`), so no
+Hindsight client library is a dependency here.
 
 ## Hindsight Setup
 
 Deploy Hindsight however suits your environment (Docker, Kubernetes, bare
-metal). By default `BridgeLayer` looks for it at `http://localhost:8888`;
-if it runs elsewhere, set `HINDSIGHT_API_BASE_URL` to point at it:
+metal, or a hosted service like Hindsight Cloud). By default `BridgeLayer`
+looks for it at `http://localhost:8888`; if it runs elsewhere, set
+`HINDSIGHT_API_BASE_URL` to point at it:
 
 ```bash
 export HINDSIGHT_API_BASE_URL=http://your-hindsight-host:8888
@@ -117,6 +120,27 @@ export HINDSIGHT_API_BASE_URL=http://your-hindsight-host:8888
 # Verify
 curl "$HINDSIGHT_API_BASE_URL/v1/default/banks" | jq '.[0]'
 ```
+
+If your Hindsight instance requires authentication (e.g. a hosted service
+using API keys), set `HINDSIGHT_API_KEY`:
+
+```bash
+export HINDSIGHT_API_BASE_URL=https://your-hosted-hindsight
+export HINDSIGHT_API_KEY=your-api-key
+```
+
+Every request then carries `Authorization: Bearer <key>`. A self-hosted
+Hindsight with no auth of its own doesn't need this set at all -- leaving
+it unset sends no Authorization header, same as before this option
+existed.
+
+Hindsight is entirely optional. If `HINDSIGHT_API_BASE_URL` points nowhere
+reachable (or you never set it up), the knowledge-graph tools
+(`create_kyo_node`, `search_knowledge`, etc.) and Mnemosyne sync work
+completely normally -- only the Hindsight-specific tools
+(`sync_to_hindsight`, `recall_from_hindsight`, `trigger_reflection`,
+`trigger_consolidation`) will fail with a clear error instead of the
+server refusing to start.
 
 ## License
 

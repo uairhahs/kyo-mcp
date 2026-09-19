@@ -117,7 +117,11 @@ trunk check --fix
 ### Hindsight
 
 Runs on `localhost:8888` (API) and `localhost:9999` (UI) by default for semantic search and
-reflection. Set `HINDSIGHT_API_BASE_URL` if it's deployed elsewhere.
+reflection. Set `HINDSIGHT_API_BASE_URL` if it's deployed elsewhere, and
+`HINDSIGHT_API_KEY` if it requires authentication (e.g. a hosted service
+like Hindsight Cloud) -- sent as `Authorization: Bearer <key>` when set,
+omitted entirely otherwise. See the root README's "Hindsight Setup"
+section for details, including running without Hindsight at all.
 
 ## License
 
