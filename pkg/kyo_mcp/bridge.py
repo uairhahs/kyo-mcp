@@ -35,21 +35,19 @@ logger = logging.getLogger(__name__)
 
 def _content_hash(content: str) -> str:
     """Hash of the exact text handed to a memory system, so a resync of an
-    unchanged concept can be recognized and skipped (2026-09-09: neither
-    sync method tracked this, so sync_all_concepts resynced every node on
-    every call regardless of whether anything had actually changed)."""
+    unchanged concept can be recognized and skipped instead of resyncing
+    every node on every call regardless of whether anything actually
+    changed."""
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-# No call into Hindsight ever set a `requests` timeout, so a slow or
-# overloaded backend (confirmed 2026-09-09: a CPU-only LLM backend under
-# concurrent load left `requests.post()` waiting indefinitely rather than
-# failing) hung every caller instead of returning a clear error. Every
-# endpoint here touches Hindsight's LLM pipeline in some way (extraction,
-# embedding/reranking, reflection, consolidation), so one generous timeout
-# covers all of them. It is generous on purpose: CPU-only prompt processing
-# on a large context can legitimately take well over a minute before
-# generation even starts.
+# Every call into Hindsight sets this timeout: without one, a slow or
+# overloaded backend leaves `requests.post()` waiting indefinitely rather
+# than failing, and every endpoint here touches Hindsight's LLM pipeline in
+# some way (extraction, embedding/reranking, reflection, consolidation), so
+# one generous timeout covers all of them. It is generous on purpose:
+# prompt processing on a large context, especially on a CPU-only backend,
+# can legitimately take well over a minute before generation even starts.
 LLM_TIMEOUT = 180
 
 
@@ -78,16 +76,13 @@ class BridgeLayer:
         Args:
             db_path: Path to the SQLite database. Defaults to None, which
                 database.py's own get_connection() resolves to the real
-                appdirs-based DB_PATH -- previously defaulted to the
-                literal string "kyo.db" here, a different (and wrong)
-                convention than the rest of the codebase uses. mcp_server.py
-                constructs BridgeLayer() with no override in three places,
-                so that mismatch silently pointed sync_all_concepts at an
-                empty database at a relative "kyo.db" path every time
-                (confirmed 2026-09-09: single-node sync tools never hit
-                this, since they never touch self.db_path, but
+                appdirs-based DB_PATH. A literal string like "kyo.db" here
+                would be a different (and wrong) convention than the rest
+                of the codebase uses, and would silently point
+                sync_all_concepts at an empty database at a relative path,
+                since single-node sync tools never touch self.db_path but
                 sync_all_concepts's query_catalog(db_path=self.db_path)
-                call always did).
+                call always does.
             mnemosyne_config: Configuration for Mnemosyne integration
             hindsight_url: URL for Hindsight API. Defaults to the
                 HINDSIGHT_API_BASE_URL env var (matching
@@ -113,21 +108,18 @@ class BridgeLayer:
             # Import mnemosyne here to avoid dependency if not needed
             from mnemosyne import remember
 
-            # mnemosyne.remember()'s first argument is a plain string (it
-            # calls content.encode() internally, confirmed via
-            # AttributeError: 'dict' object has no attribute 'encode' when
-            # this used to pass a whole structured dict as `content`
-            # instead). Structured fields belong in the separate
-            # `metadata` parameter.
+            # mnemosyne.remember()'s first argument must be a plain string
+            # -- it calls content.encode() internally, so passing a
+            # structured dict here raises an AttributeError. Structured
+            # fields belong in the separate `metadata` parameter.
             content = f"{concept.title}: {concept.description or ''}"
 
             # Skip if this exact content was already synced. Without this,
             # sync_all_concepts resynced every node on every call, and
             # since each resync re-runs a non-deterministic LLM extraction,
-            # Hindsight's own dedup (matched on text similarity) often
-            # didn't recognize repeats of an unchanged concept as the same
-            # thing, so noise piled up (2026-09-09: 168 of 192 facts in the
-            # kyo bank stuck at proof_count=1 after repeated test syncs).
+            # Hindsight's own dedup (matched on text similarity) doesn't
+            # always recognize repeats of an unchanged concept as the same
+            # thing, letting near-duplicate facts pile up.
             new_hash = _content_hash(content)
             if get_sync_hash(concept.id, "mnemosyne", db_path=self.db_path) == new_hash:
                 logger.info(
@@ -135,18 +127,16 @@ class BridgeLayer:
                 )
                 return True
 
-            # remember() is synchronous (returns str, not a coroutine,
-            # confirmed via TypeError 2026-09-09), unlike this method's own
-            # async signature -- no await here.
+            # remember() is synchronous (returns str, not a coroutine),
+            # unlike this method's own async signature -- no await here.
             remember(
                 content,
                 metadata={
                     "okf_id": concept.id,
                     "concept_type": concept.type,
                     "tags": concept.tags or [],
-                    # OKFConcept has no created_at field (confirmed via
-                    # AttributeError 2026-09-09); generated.at is the
-                    # actual ISO 8601 timestamp field, already a string.
+                    # OKFConcept has no created_at field; generated.at is
+                    # the actual ISO 8601 timestamp field, already a string.
                     "created_at": concept.generated.at if concept.generated else None,
                 },
             )
@@ -161,15 +151,14 @@ class BridgeLayer:
     async def sync_concept_to_hindsight(self, concept: OKFConcept) -> bool:
         """Submit an OKF concept to Hindsight for fact extraction.
 
-        2026-09-15: this used to POST with Hindsight's default async=false,
-        blocking on the full extraction pipeline synchronously. Confirmed
-        via the-fleet-host's SYCL inference backend that a single retain call can
-        legitimately take 45+ minutes (a prompt-processing regression on
-        the LLM side, tracked separately) -- well past this method's own
-        LLM_TIMEOUT, so the `requests.post()` reliably raised a client-side
-        timeout and every such call was reported as "failed" regardless of
-        whether Hindsight would have eventually finished it. Hindsight's own
-        /memories endpoint already supports `async=true` + a client-supplied
+        This used to POST with Hindsight's default async=false, blocking on
+        the full extraction pipeline synchronously. On a slow or
+        CPU-bound backend, a single retain call can legitimately take far
+        longer than this method's own LLM_TIMEOUT, so the `requests.post()`
+        reliably raised a client-side timeout and every such call was
+        reported as "failed" regardless of whether Hindsight would have
+        eventually finished it. Hindsight's own /memories endpoint already
+        supports `async=true` + a client-supplied
         `operation_id` (idempotent: resubmitting the same id against
         unchanged content returns the existing operation rather than
         enqueuing a duplicate) plus a GET .../operations/{operation_id} to
@@ -359,10 +348,9 @@ class BridgeLayer:
                 # Defensive truncation. As of hindsight-api 0.9.x, this
                 # endpoint's `top_k` is silently ignored server-side: it
                 # returns every memory in the bank instead of the requested
-                # count (confirmed 2026-09-09: a 5-result request against an
-                # 81-fact bank returned all 81, correctly ranked by score but
-                # never sliced). Ranking itself is fine, so slicing here is
-                # sufficient; the real fix belongs upstream in hindsight-api.
+                # count, correctly ranked by score but never sliced.
+                # Ranking itself is fine, so slicing here is sufficient;
+                # the real fix belongs upstream in hindsight-api.
                 return results[:top_k]
             else:
                 logger.error(
@@ -442,9 +430,9 @@ class BridgeLayer:
             # Query all concepts from the database. Must be a keyword
             # arg: query_catalog's first positional parameter is
             # type_filter, not db_path, so passing self.db_path
-            # positionally (confirmed 2026-09-09) filtered on
-            # type = '<the db file path string>' and silently matched
-            # zero rows every time.
+            # positionally would filter on
+            # type = '<the db file path string>' and silently match zero
+            # rows every time.
             concepts = query_catalog(db_path=self.db_path)
 
             stats = {"total": 0, "mnemosyne_success": 0, "hindsight_success": 0}

@@ -15,9 +15,8 @@ HINDSIGHT_BASE_URL = os.environ.get("HINDSIGHT_API_BASE_URL", "http://localhost:
 TEST_BANK_ID = "kyo-test"
 
 # None of these calls used to set a requests timeout, so a slow or
-# overloaded Hindsight backend hung the whole test run indefinitely instead
-# of failing (confirmed 2026-09-09 against a CPU-only LLM backend under
-# concurrent load). HTTP_TIMEOUT covers plain reads; LLM_TIMEOUT covers a
+# overloaded Hindsight backend could hang the whole test run indefinitely
+# instead of failing. HTTP_TIMEOUT covers plain reads; LLM_TIMEOUT covers a
 # single synchronous LLM-backed request/response cycle (recall/reflect/
 # consolidate) and is generous on purpose, since CPU-only prompt processing
 # on a large context can legitimately take well over a minute.
@@ -25,13 +24,12 @@ HTTP_TIMEOUT = 30
 LLM_TIMEOUT = 180
 
 # A queued retain operation (async store) is a separate budget from
-# LLM_TIMEOUT: confirmed against a CPU-only backend that prompt eval alone
-# can take well over a minute before generation even starts, and retain's
-# own generation has no output-token cap -- observed running past several
-# thousand tokens with no sign of stopping in one real case. 180s was not
-# enough for a real store to reach "completed" against a backend like that
-# (confirmed: tests that waited for completion failed on timeout, not on a
-# wrong result), so this is deliberately much larger.
+# LLM_TIMEOUT: on a slow or CPU-only backend, prompt eval alone can take
+# well over a minute before generation even starts, and retain's own
+# generation has no output-token cap, so it can keep running for a long
+# time with no natural stopping point. This is deliberately much larger
+# than LLM_TIMEOUT to give a real store a fair chance to reach "completed"
+# on such a backend.
 OPERATION_TIMEOUT = 900
 
 
@@ -39,10 +37,9 @@ def _store_memory(content, tags=None, importance=5, bank_id=TEST_BANK_ID):
     """Submit a memory with async=True, matching bridge.py's
     sync_concept_to_hindsight. A synchronous (async=False) store blocks on
     the full retain/extraction pipeline, which has no output-token cap on
-    the LLM side -- confirmed directly against a real backend, where a
-    single retain call's generation ran past 470+ tokens with no sign of
-    stopping. async=True returns as soon as the item is enqueued,
-    regardless of how long extraction itself takes.
+    the LLM side and can run for a long time with no natural stopping
+    point on a slow backend. async=True returns as soon as the item is
+    enqueued, regardless of how long extraction itself takes.
     """
     operation_id = str(uuid.uuid4())
     item = {"content": content, "importance": importance}

@@ -6,7 +6,7 @@ Kyo (経) is a knowledge graph MCP server that implements Google's Open Knowledg
 
 ## Architecture
 
-```
+```ascii
 ┌─────────────────────────────────────────────────────────┐
 │                       MCP Client                          │
 └──────────────────────┬──────────────────────────────────┘
@@ -51,7 +51,7 @@ uv run python -m kyo_mcp.mcp_server --transport streamable-http --port 8000
 
 ## Project Structure
 
-```
+```ascii
 kyo/
 ├── pkg/
 │   ├── kyo_mcp/           # Core package
