@@ -44,6 +44,10 @@ uv run python -m kyo_mcp.mcp_server --transport sse --port 8000
 uvx --from "git+https://github.com/uairhahs/kyo-mcp#subdirectory=pkg" kyo-mcp
 ```
 
+Assumes Hindsight is reachable at `http://localhost:8888`; set
+`HINDSIGHT_API_BASE_URL` first if it's deployed elsewhere (see
+[Integration](#integration) below).
+
 ## Transport Options
 
 | Transport         | Use Case                  | Command                                                                       |

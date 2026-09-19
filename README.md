@@ -56,6 +56,10 @@ uvx --from "git+https://github.com/uairhahs/kyo-mcp#subdirectory=pkg" kyo-mcp
 uvx --from "git+https://github.com/uairhahs/kyo-mcp#subdirectory=pkg" kyo-mcp --transport streamable-http --port 8000
 ```
 
+This assumes Hindsight is reachable at `http://localhost:8888`. If it's
+running elsewhere, set `HINDSIGHT_API_BASE_URL` before the `uvx` call --
+see [Hindsight Setup](#hindsight-setup) below.
+
 ## Project Structure
 
 ```ascii
