@@ -49,6 +49,13 @@ uv run python -m kyo_mcp.mcp_server
 uv run python -m kyo_mcp.mcp_server --transport streamable-http --port 8000
 ```
 
+### Run without cloning, via uvx
+
+```bash
+uvx --from "git+https://github.com/uairhahs/kyo-mcp#subdirectory=pkg" kyo-mcp
+uvx --from "git+https://github.com/uairhahs/kyo-mcp#subdirectory=pkg" kyo-mcp --transport streamable-http --port 8000
+```
+
 ## Project Structure
 
 ```ascii

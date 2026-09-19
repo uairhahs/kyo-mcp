@@ -39,6 +39,9 @@ uv run python -m kyo_mcp.mcp_server --transport streamable-http --port 8000
 
 # Start MCP server (SSE)
 uv run python -m kyo_mcp.mcp_server --transport sse --port 8000
+
+# Or run directly with uvx, no clone needed
+uvx --from "git+https://github.com/uairhahs/kyo-mcp#subdirectory=pkg" kyo-mcp
 ```
 
 ## Transport Options
