@@ -13,6 +13,7 @@ Commands:
     query_catalog <query> [--limit N] [--verified-only]
     sync_to_mnemosyne <concept_id>
     sync_to_hindsight <concept_id>
+    check_hindsight_operation <concept_id>
     recall_from_hindsight <query> [--limit N]
     sync_all
 """
@@ -144,6 +145,16 @@ async def cmd_sync_to_hindsight(args: argparse.Namespace) -> str:
         return json.dumps({"error": str(e)})
 
 
+async def cmd_check_hindsight_operation(args: argparse.Namespace) -> str:
+    """Check the status of a concept's in-flight Hindsight sync operation."""
+    try:
+        bridge = BridgeLayer()
+        result = await bridge.check_hindsight_operation(args.concept_id)
+        return json.dumps(result, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
 async def cmd_recall_from_hindsight(args: argparse.Namespace) -> str:
     """Recall from Hindsight."""
     try:
@@ -218,6 +229,10 @@ async def main():
     p_sync_hind = subparsers.add_parser("sync_to_hindsight")
     p_sync_hind.add_argument("concept_id", type=str)
 
+    # check_hindsight_operation
+    p_check_hind = subparsers.add_parser("check_hindsight_operation")
+    p_check_hind.add_argument("concept_id", type=str)
+
     # recall_from_hindsight
     p_recall = subparsers.add_parser("recall_from_hindsight")
     p_recall.add_argument(
@@ -242,6 +257,7 @@ async def main():
         "query_catalog": cmd_query_catalog,  # sync
         "sync_to_mnemosyne": cmd_sync_to_mnemosyne,  # async
         "sync_to_hindsight": cmd_sync_to_hindsight,  # async
+        "check_hindsight_operation": cmd_check_hindsight_operation,  # async
         "recall_from_hindsight": cmd_recall_from_hindsight,  # async
         "sync_all": cmd_sync_all,  # async
         "trigger_consolidation": cmd_trigger_consolidation,  # async
