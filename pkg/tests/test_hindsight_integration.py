@@ -59,7 +59,7 @@ def _wait_for_operation(
     """Poll .../operations/{operation_id} (the same endpoint
     check_hindsight_operation in bridge.py polls) until it reaches a
     terminal status or the timeout elapses. Bounded, unlike blocking on the
-    store call itself -- a slow backend fails this with a clear assertion
+    store call itself: a slow backend fails this with a clear assertion
     instead of hanging the whole test run."""
     deadline = time.monotonic() + timeout
     status = None
@@ -170,7 +170,7 @@ class TestHindsightMemoryOperations:
 
     def test_store_memory(self):
         """Test storing a memory. Only checks that the item was accepted
-        (matching the original, pre-async test's own scope) -- not that
+        (matching the original, pre-async test's own scope), not that
         extraction has finished. Waiting for completion here would
         reintroduce the same long block that switching to async=True was
         meant to remove; see test_recall_memory below for a case that

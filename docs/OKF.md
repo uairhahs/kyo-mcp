@@ -10,11 +10,11 @@
 > particular agent, framework, model provider, or serving system**. The
 > goal is simple:
 >
-> - **Anyone can produce** OKF — humans authoring by hand, agents built on
+> - **Anyone can produce** OKF: humans authoring by hand, agents built on
 >   any framework (Google ADK, LangChain, custom), export pipelines from
 >   existing catalogs (Dataplex, Unity Catalog, Collibra, …), or scripts
 >   walking a database.
-> - **Anyone can serve and consume** OKF — a static file server, a
+> - **Anyone can serve and consume** OKF: a static file server, a
 >   knowledge-management UI (Obsidian, Notion, MkDocs), an LLM loading
 >   files into context, a search index, or a graph viewer like the one
 >   bundled in this repo.
@@ -22,18 +22,18 @@
 > The agent below is a **proof of concept** demonstrating _one_ way to
 > produce OKF bundles automatically. The format itself is the
 > contribution; this agent and the visualizer exist to make the format
-> tangible at both ends — production and consumption.
+> tangible at both ends, production and consumption.
 >
-> **See OKF in practice** — three ready-to-browse bundles produced by this
+> **See OKF in practice**: three ready-to-browse bundles produced by this
 > agent, checked into [`bundles/`](bundles/):
 >
-> - [`bundles/ga4/`](bundles/ga4/) — GA4 e-commerce dataset
+> - [`bundles/ga4/`](bundles/ga4/): GA4 e-commerce dataset
 >   ([viz.html](bundles/ga4/viz.html))
-> - [`bundles/stackoverflow/`](bundles/stackoverflow/) — Stack Overflow
+> - [`bundles/stackoverflow/`](bundles/stackoverflow/): Stack Overflow
 >   public dataset ([viz.html](bundles/stackoverflow/viz.html))
-> - [`bundles/crypto_bitcoin/`](bundles/crypto_bitcoin/) — Bitcoin
+> - [`bundles/crypto_bitcoin/`](bundles/crypto_bitcoin/): Bitcoin
 >   blocks/transactions ([viz.html](bundles/crypto_bitcoin/viz.html))
-> - [`bundles/acme_retail/`](bundles/acme_retail/) — Acme Retail
+> - [`bundles/acme_retail/`](bundles/acme_retail/): Acme Retail
 >   ([viz.html](bundles/acme_retail/viz.html))
 
 ## Why OKF?
@@ -46,8 +46,8 @@ properties that are hard to get from a service-owned metadata store:
   reader and the content. An engineer can `cat` a concept; an LLM can ingest
   it verbatim into context.
 - **Version-controllable out of the box.** Bundles live in git. Pull
-  requests, line-by-line diffs, blame, and review workflows just work —
-  knowledge curation becomes a normal software-engineering activity.
+  requests, line-by-line diffs, blame, and review workflows just work,
+  and knowledge curation becomes a normal software-engineering activity.
 - **Portable and lock-in free.** A bundle is a directory. Ship it as a
   tarball, host it in any repo, mount it from any filesystem, or sync it to
   any system that speaks files. No proprietary API stands between you and
@@ -57,17 +57,17 @@ properties that are hard to get from a service-owned metadata store:
   `resource`, `tags`, `generated`, `status`); use the markdown body for the
   prose, schemas, and example queries that LLMs and humans actually read.
 - **Trust, provenance, and freshness are first-class.** v0.2 puts queryable
-  signals in frontmatter — where a concept came from (`sources` with per-source
+  signals in frontmatter: where a concept came from (`sources` with per-source
   credibility signals), who produced and confirmed it (`generated`, `verified`,
   from which consumers derive a trust tier), and whether it is still current
-  (`status`, `stale_after`) — so an agent-maintained corpus stays trustable
+  (`status`, `stale_after`), so an agent-maintained corpus stays trustable
   without any bespoke runtime.
 - **Minimally opinionated, freely extensible.** A small set of required
   keys ensures interoperability, but bundles can carry arbitrary extra
   frontmatter keys and arbitrary body sections without breaking
   consumers.
-- **Composes with existing tooling.** Many knowledge tools — Notion,
-  Obsidian, MkDocs, Hugo, Jekyll — already speak markdown plus YAML
+- **Composes with existing tooling.** Many knowledge tools (Notion,
+  Obsidian, MkDocs, Hugo, Jekyll) already speak markdown plus YAML
   frontmatter, so bundles can be browsed, edited, or rendered without
   custom UI.
 - **Progressive disclosure built in.** Auto-generated `index.md` files
@@ -114,7 +114,7 @@ so the agent cannot overrun. Use `--no-web` to skip the web pass.
 
 ## Run
 
-Minimum invocation — point at a BigQuery dataset and a bundle output
+Minimum invocation: point at a BigQuery dataset and a bundle output
 directory. Seeds for the web pass are explicit; omit them (or pass
 `--no-web`) to run BQ-only:
 
@@ -136,18 +136,18 @@ exact `enrich` command) with the **produced bundle** (`bundles/<name>/`)
 that the recipe generated. Open the recipe to reproduce; open the bundle
 to browse the result directly.
 
-- **GA4 Google Merchandise Store** — public e-commerce dataset, seeded
+- **GA4 Google Merchandise Store**: public e-commerce dataset, seeded
   with canonical GA4 BigQuery Export documentation URLs.
   · [recipe](samples/ga4_merch_store/README.md)
   · [bundle](bundles/ga4/)
   · [viz.html](bundles/ga4/viz.html)
-- **Stack Overflow** — public dataset (mirror of the Stack Exchange Data
+- **Stack Overflow**: public dataset (mirror of the Stack Exchange Data
   Dump), seeded with the community's canonical schema references.
   Exercises multi-concept enrichment from cross-cutting docs pages.
   · [recipe](samples/stackoverflow/README.md)
   · [bundle](bundles/stackoverflow/)
   · [viz.html](bundles/stackoverflow/viz.html)
-- **Bitcoin (crypto)** — public dataset (blocks, transactions, inputs,
+- **Bitcoin (crypto)**: public dataset (blocks, transactions, inputs,
   outputs) from the `bitcoin-etl` pipeline. Exercises cross-table
   foreign-key relationships in prose.
   · [recipe](samples/crypto_bitcoin/README.md)
@@ -157,7 +157,7 @@ to browse the result directly.
 ## Visualize
 
 The `visualize` subcommand renders any OKF bundle as a **self-contained
-interactive HTML file** — one file, no backend, no install on the
+interactive HTML file**: one file, no backend, no install on the
 viewing side. Open it in any modern browser, share it as an artifact,
 host it on a static file server, or commit it next to the bundle (as
 this repo does).
@@ -173,7 +173,7 @@ one shape.
   colored nodes by type (datasets, tables, references, …) and directed
   edges drawn from each cross-link in the markdown bodies.
 - A **detail panel** for the selected concept showing its frontmatter
-  (description, resource link, tags) and its rendered markdown body —
+  (description, resource link, tags) and its rendered markdown body,
   with internal `[…](/path/to/concept.md)` links rewired to navigate
   within the viewer instead of following the path.
 - A **"Cited by" backlinks** list under each concept (computed from the

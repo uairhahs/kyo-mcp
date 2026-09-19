@@ -34,7 +34,7 @@ def setup_test_env(tmp_path):
 
 @pytest.fixture
 def db_path():
-    """Return a path string — tests should use the autouse fixture instead."""
+    """Return a path string; tests should use the autouse fixture instead."""
     return ""
 
 

@@ -92,7 +92,7 @@ class BridgeLayer:
             hindsight_api_key: Bearer token for a hosted Hindsight instance
                 (e.g. Hindsight Cloud) that requires authentication.
                 Defaults to the HINDSIGHT_API_KEY env var, then None. A
-                self-hosted Hindsight has no auth of its own -- when this
+                self-hosted Hindsight has no auth of its own, so when this
                 is None, no Authorization header is sent at all, matching
                 every request this class made before this option existed.
         """
@@ -129,8 +129,8 @@ class BridgeLayer:
             # Import mnemosyne here to avoid dependency if not needed
             from mnemosyne import remember
 
-            # mnemosyne.remember()'s first argument must be a plain string
-            # -- it calls content.encode() internally, so passing a
+            # mnemosyne.remember()'s first argument must be a plain string:
+            # it calls content.encode() internally, so passing a
             # structured dict here raises an AttributeError. Structured
             # fields belong in the separate `metadata` parameter.
             content = f"{concept.title}: {concept.description or ''}"
@@ -149,7 +149,7 @@ class BridgeLayer:
                 return True
 
             # remember() is synchronous (returns str, not a coroutine),
-            # unlike this method's own async signature -- no await here.
+            # unlike this method's own async signature, so no await here.
             remember(
                 content,
                 metadata={
@@ -183,7 +183,7 @@ class BridgeLayer:
         `operation_id` (idempotent: resubmitting the same id against
         unchanged content returns the existing operation rather than
         enqueuing a duplicate) plus a GET .../operations/{operation_id} to
-        poll status -- see check_hindsight_operation below. Submission with
+        poll status; see check_hindsight_operation below. Submission with
         async=true returns as soon as Hindsight has enqueued the work, so
         this call is now fast regardless of how long extraction itself
         takes; the underlying LLM call is no longer this method's problem.
@@ -194,7 +194,7 @@ class BridgeLayer:
         Returns:
             True if the submission was accepted (queued or already
             in-flight/complete), False if the submission itself failed.
-            This does NOT mean extraction has finished -- call
+            This does NOT mean extraction has finished; call
             check_hindsight_operation to find out when it has.
         """
         try:
@@ -217,7 +217,7 @@ class BridgeLayer:
                 return True
 
             # Skip if there's already an in-flight submission for this exact
-            # content -- otherwise every retry before the first one resolves
+            # content, otherwise every retry before the first one resolves
             # would submit a fresh operation_id (since it's derived from
             # new_hash below, a *stale* one wouldn't collide, just duplicate
             # the work).
@@ -225,7 +225,7 @@ class BridgeLayer:
             if existing and existing[1] == new_hash:
                 logger.info(
                     f"Skipping {concept.id}: operation {existing[0]} already "
-                    "in flight for this content -- use check_hindsight_operation"
+                    "in flight for this content; use check_hindsight_operation"
                 )
                 return True
 
@@ -234,7 +234,7 @@ class BridgeLayer:
             # process died after Hindsight accepted the request but before
             # it recorded the operation_id locally) reuses the same id.
             # Hindsight treats that as "return the existing operation," not
-            # a duplicate -- reusing an id against genuinely *different*
+            # a duplicate: reusing an id against genuinely *different*
             # content would instead get HTTP 409, which is exactly why this
             # is derived from new_hash rather than concept.id alone.
             operation_id = str(
@@ -294,7 +294,7 @@ class BridgeLayer:
             it was deleted server-side); cleared locally for the same
             reason as failed/cancelled.
           - "error": the status check itself failed (network error, bad
-            response) -- the pending operation is left untouched so a later
+            response); the pending operation is left untouched so a later
             check can retry.
         """
         pending = get_hindsight_operation(node_id, db_path=self.db_path)

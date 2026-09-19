@@ -52,7 +52,7 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
     # Track a Hindsight retain submitted with async=true (2026-09-15: every
     # prior sync_to_hindsight call blocked on Hindsight's full fact-extraction
     # pipeline synchronously, which stalls for as long as the underlying LLM
-    # call takes -- confirmed to reach 45+ minutes once, well past bridge.py's
+    # call takes: confirmed to reach 45+ minutes once, well past bridge.py's
     # own 180s requests timeout, so every such call reliably "failed" client-
     # side regardless of whether Hindsight would have eventually succeeded.
     # Hindsight's own /memories endpoint already supports async=true +
@@ -348,7 +348,7 @@ def set_hindsight_operation(
 
 def clear_hindsight_operation(node_id: str, db_path: Optional[Path] = None) -> None:
     """Clear a node's in-flight Hindsight operation tracking, once it's
-    resolved (completed, failed, cancelled, or found stale) -- leaving it
+    resolved (completed, failed, cancelled, or found stale). Leaving it
     set would make every later sync_to_hindsight call think one is still
     pending and refuse to submit a fresh one."""
     conn = get_connection(db_path)

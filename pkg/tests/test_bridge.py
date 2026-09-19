@@ -7,8 +7,8 @@ guard the optional Authorization header for a hosted Hindsight instance
 (e.g. Hindsight Cloud, which requires `Authorization: Bearer <key>`):
 since bridge.py builds each requests.post/get call individually rather
 than through one shared client, a future edit to any one call site could
-silently forget to wire the header through, or -- the regression that
-actually matters -- send it when no key is configured, breaking every
+silently forget to wire the header through, or (the regression that
+actually matters) send it when no key is configured, breaking every
 self-hosted Hindsight deployment that has no auth of its own.
 """
 
@@ -67,8 +67,8 @@ class TestHindsightHeaders:
 
 class TestHindsightCallsSendCorrectHeaders:
     """One pair of tests (no key / with key) per Hindsight HTTP call
-    site, so a future call site that forgets to wire the header through
-    -- in either direction -- fails here instead of only surfacing against
+    site, so a future call site that forgets to wire the header through,
+    in either direction, fails here instead of only surfacing against
     a real hosted Hindsight deployment."""
 
     @pytest.mark.asyncio

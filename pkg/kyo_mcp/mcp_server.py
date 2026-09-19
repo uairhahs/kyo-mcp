@@ -250,8 +250,8 @@ async def sync_to_hindsight(node_id: str) -> str:
     """Queue a knowledge node for Hindsight fact extraction.
 
     This submits the node asynchronously (Hindsight's own async=true
-    retain mode) and returns as soon as it's queued -- fact extraction
-    itself can take a long time on this fleet's local LLM backend, so this
+    retain mode) and returns as soon as it's queued. Fact extraction
+    itself can take a long time on a slow or CPU-only LLM backend, so this
     call no longer waits for it to finish. Use check_hindsight_sync_status
     to find out when extraction has actually completed.
     """
