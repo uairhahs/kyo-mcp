@@ -342,3 +342,47 @@ class TestBulkEfficiency:
 
         concept = OKFConcept(id="same", type="concept", title="T", description="D")
         assert await BridgeLayer().sync_concept_to_mnemosyne(concept) is True
+
+
+class TestRetainRetry:
+    @pytest.mark.asyncio
+    async def test_failed_retain_is_retried_under_new_operation_id(self):
+        """Hindsight replays a known operation_id even if that operation
+        failed, so a retry must use a new id; an unacknowledged resubmit
+        must still reuse the same one."""
+        from kyo_mcp.database import create_concept, get_hindsight_operation
+
+        create_concept({"id": "n1", "type": "concept", "title": "Node"})
+        concept = _concept().model_copy(
+            update={"id": "n1", "title": "Node", "description": None}
+        )
+        bridge = BridgeLayer()
+
+        async def submit():
+            with patch(
+                "httpx.AsyncClient.request",
+                new_callable=AsyncMock,
+                return_value=_mock_response(200, {}),
+            ) as request:
+                assert await bridge.sync_concept_to_hindsight(concept)
+            return request
+
+        first = (await submit()).call_args.kwargs["json"]["operation_id"]
+
+        with patch(
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            return_value=_mock_response(200, {"status": "failed"}),
+        ):
+            assert (await bridge.check_hindsight_operation("n1"))["state"] == "failed"
+        assert get_hindsight_operation("n1") is None
+
+        retry = (await submit()).call_args.kwargs["json"]["operation_id"]
+        assert retry != first
+        assert get_hindsight_operation("n1")[0] == retry
+
+        # A resubmit after a lost acknowledgement derives the same id.
+        from kyo_mcp.database import clear_hindsight_operation
+
+        clear_hindsight_operation("n1")
+        assert (await submit()).call_args.kwargs["json"]["operation_id"] == retry

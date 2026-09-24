@@ -23,6 +23,8 @@ from typing import Any, Dict, List, Optional
 import httpx
 from kyo_mcp.database import (
     clear_hindsight_operation,
+    fail_hindsight_operation,
+    get_failed_hindsight_operation,
     get_hindsight_operation,
     get_sync_hash,
     list_pending_hindsight_operations,
@@ -281,10 +283,14 @@ class BridgeLayer:
             # id, which Hindsight treats as "return the existing
             # operation". Reusing an id against different content gets
             # HTTP 409 instead, which is why this is derived from new_hash
-            # rather than concept.id alone.
-            operation_id = str(
-                uuid.uuid5(uuid.NAMESPACE_URL, f"kyo-hindsight:{concept.id}:{new_hash}")
-            )
+            # rather than concept.id alone. Hindsight replays a known id
+            # even when that operation failed, so after a failure the id
+            # is also derived from the failed one to get a real retry.
+            seed = f"kyo-hindsight:{concept.id}:{new_hash}"
+            failed = get_failed_hindsight_operation(concept.id, db_path=self.db_path)
+            if failed:
+                seed += f":after:{failed}"
+            operation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
 
             response = await self._hindsight_request(
                 "POST",
@@ -328,8 +334,9 @@ class BridgeLayer:
             been promoted so a future sync_concept_to_hindsight call with
             the same content will skip as already-synced.
           - "failed" / "cancelled": extraction did not succeed; the pending
-            operation has been cleared so a fresh sync_concept_to_hindsight
-            call will submit a new attempt. "error" holds Hindsight's own
+            operation has been cleared and recorded as failed, so a fresh
+            sync_concept_to_hindsight call will submit a new attempt under
+            a new operation_id. "error" holds Hindsight's own
             error_message when present.
           - "not_found": Hindsight has no record of this operation_id (e.g.
             it was deleted server-side); cleared locally for the same
@@ -363,8 +370,11 @@ class BridgeLayer:
                 )
                 return {"state": "completed", "operation_id": operation_id}
 
-            if status in ("failed", "cancelled", "not_found"):
+            if status in ("failed", "cancelled"):
+                fail_hindsight_operation(node_id, operation_id, db_path=self.db_path)
+            elif status == "not_found":
                 clear_hindsight_operation(node_id, db_path=self.db_path)
+            if status in ("failed", "cancelled", "not_found"):
                 logger.warning(
                     f"Hindsight operation {operation_id} for {node_id}: {status}"
                 )

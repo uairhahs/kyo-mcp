@@ -135,6 +135,13 @@ def _migrate_v4(cursor: sqlite3.Cursor) -> None:
     cursor.execute("INSERT INTO knowledge_fts(knowledge_fts) VALUES ('rebuild')")
 
 
+def _migrate_v5(cursor: sqlite3.Cursor) -> None:
+    """The last Hindsight retain for each node that failed or was cancelled.
+    Hindsight replays an operation_id it has already seen, whatever that
+    operation's status, so a retry must be submitted under a new id."""
+    _add_columns(cursor, ["hindsight_failed_operation_id"])
+
+
 # Append-only: each entry upgrades the schema from version i to i + 1, and
 # PRAGMA user_version records how many have been applied.
 MIGRATIONS: List[Callable[[sqlite3.Cursor], None]] = [
@@ -142,6 +149,7 @@ MIGRATIONS: List[Callable[[sqlite3.Cursor], None]] = [
     _migrate_v2,
     _migrate_v3,
     _migrate_v4,
+    _migrate_v5,
 ]
 
 
@@ -516,6 +524,35 @@ def clear_hindsight_operation(node_id: str, db_path: Optional[Path] = None) -> N
             "SET hindsight_operation_id = NULL, hindsight_pending_hash = NULL "
             "WHERE id = ?",
             (node_id,),
+        )
+
+
+def get_failed_hindsight_operation(
+    node_id: str, db_path: Optional[Path] = None
+) -> Optional[str]:
+    """Return the id of this node's last failed or cancelled Hindsight
+    retain, or None."""
+    conn = get_connection(db_path)
+    row = conn.execute(
+        "SELECT hindsight_failed_operation_id FROM knowledge_concepts WHERE id = ?",
+        (node_id,),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def fail_hindsight_operation(
+    node_id: str, operation_id: str, db_path: Optional[Path] = None
+) -> None:
+    """Clear a node's in-flight operation and remember it as failed, so the
+    next submission uses a fresh operation_id instead of replaying it."""
+    conn = get_connection(db_path)
+    with _lock, conn:
+        conn.execute(
+            "UPDATE knowledge_concepts "
+            "SET hindsight_operation_id = NULL, hindsight_pending_hash = NULL, "
+            "hindsight_failed_operation_id = ? "
+            "WHERE id = ?",
+            (operation_id, node_id),
         )
 
 
