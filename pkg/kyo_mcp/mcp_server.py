@@ -10,15 +10,14 @@ stdio client, plus the CLI) can share one database, so no graph state is
 cached in memory; graph algorithms build a NetworkX view on demand.
 """
 
-import datetime
 import itertools
 import logging
-import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 import networkx as nx
 from kyo_mcp.bridge import BridgeLayer
+from kyo_mcp.common import GENERATOR, is_stale, new_node_id, now_iso
 from kyo_mcp.database import (
     create_concept,
     create_link,
@@ -42,38 +41,12 @@ from kyo_mcp.ontology import export_to_rdf_turtle
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.mcpserver.server import MCPServer
 
-GENERATOR = "process:kyo-mcp"
-
 mcp = MCPServer(
     name="Kyo Catalogue Manager",
     title="Kyo Knowledge Catalogue",
     description="OKF v0.2 knowledge graph with Mnemosyne & Hindsight integration",
     version="0.2.0",
 )
-
-
-def now_iso() -> str:
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def new_node_id() -> str:
-    """Random, not sequential: ids derived from a node count collide when
-    two processes create nodes against the same database."""
-    return f"kyo-{uuid.uuid4().hex[:12]}"
-
-
-def is_stale(stale_after: Optional[str]) -> bool:
-    """True once the OKF `stale_after` date/time has passed. Unparseable
-    values are treated as not stale rather than raising."""
-    if not stale_after:
-        return False
-    try:
-        cutoff = datetime.datetime.fromisoformat(stale_after)
-    except ValueError:
-        return False
-    if cutoff.tzinfo is None:
-        cutoff = cutoff.replace(tzinfo=datetime.timezone.utc)
-    return datetime.datetime.now(datetime.timezone.utc) >= cutoff
 
 
 def build_graph(db_path: Optional[Path] = None) -> nx.MultiDiGraph:

@@ -29,15 +29,22 @@ import json
 import sys
 from typing import Any
 
-from kyo_mcp.bridge import BridgeLayer
 from kyo_mcp.database import (
     create_concept,
     create_link,
     get_concept_by_id,
     query_catalog,
 )
-from kyo_mcp.mcp_server import GENERATOR, new_node_id, now_iso
+from kyo_mcp.common import GENERATOR, new_node_id, now_iso
 from kyo_mcp.okf_schema import OKFConcept
+
+
+def _bridge():
+    """Import the bridge (httpx, and Mnemosyne when used) only for commands
+    that talk to a memory system, so catalogue-only commands start fast."""
+    from kyo_mcp.bridge import BridgeLayer
+
+    return BridgeLayer()
 
 
 class CommandError(Exception):
@@ -101,26 +108,26 @@ def cmd_create_link(args: argparse.Namespace) -> Any:
 
 async def cmd_sync_to_mnemosyne(args: argparse.Namespace) -> Any:
     """Sync concept to Mnemosyne."""
-    bridge = BridgeLayer()
+    bridge = _bridge()
     success = await bridge.sync_concept_to_mnemosyne(_load_concept(args.concept_id))
     return {"success": success, "error": bridge.last_error}
 
 
 async def cmd_sync_to_hindsight(args: argparse.Namespace) -> Any:
     """Queue concept for Hindsight fact extraction."""
-    bridge = BridgeLayer()
+    bridge = _bridge()
     success = await bridge.sync_concept_to_hindsight(_load_concept(args.concept_id))
     return {"success": success, "error": bridge.last_error}
 
 
 async def cmd_check_hindsight_operation(args: argparse.Namespace) -> Any:
     """Check the status of a concept's in-flight Hindsight sync operation."""
-    return await BridgeLayer().check_hindsight_operation(args.concept_id)
+    return await _bridge().check_hindsight_operation(args.concept_id)
 
 
 async def cmd_recall_from_hindsight(args: argparse.Namespace) -> Any:
     """Recall from Hindsight."""
-    bridge = BridgeLayer()
+    bridge = _bridge()
     results = await bridge.recall_from_hindsight(
         " ".join(args.query), top_k=args.limit or 10
     )
@@ -131,12 +138,12 @@ async def cmd_recall_from_hindsight(args: argparse.Namespace) -> Any:
 
 async def cmd_sync_all(args: argparse.Namespace) -> Any:
     """Sync all concepts."""
-    return await BridgeLayer().sync_all_concepts()
+    return await _bridge().sync_all_concepts()
 
 
 async def cmd_trigger_consolidation(args: argparse.Namespace) -> Any:
     """Trigger Hindsight consolidation."""
-    bridge = BridgeLayer()
+    bridge = _bridge()
     success = await bridge.trigger_consolidation()
     return {"success": success, "error": bridge.last_error}
 
@@ -150,7 +157,7 @@ async def cmd_trigger_reflection(args: argparse.Namespace) -> Any:
         query = f"{concept.title}: {concept.description or ''}".strip()
     if not query:
         raise CommandError("Pass a query or --concept-id")
-    bridge = BridgeLayer()
+    bridge = _bridge()
     result = await bridge.trigger_reflection(query)
     if bridge.last_error:
         raise CommandError(bridge.last_error)
