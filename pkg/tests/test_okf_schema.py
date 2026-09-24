@@ -81,3 +81,34 @@ class TestOKFConcept:
         dumped = concept.model_dump(mode="python")
         assert dumped["id"] == "test-001"
         assert dumped["type"] == "concept"
+
+
+class TestToMarkdown:
+    def test_includes_trust_and_freshness(self):
+        concept = OKFConcept(
+            type="concept",
+            title="T",
+            status="draft",
+            stale_after="2030-01-01",
+            verified=[VerificationEntry(by="human:alice", at="2024-01-01T00:00:00Z")],
+            sources=[ProvenanceSource(resource="https://example.com")],
+            metadata={"owner": "team-a", "type": "ignored"},
+        )
+        md = concept.to_markdown("# Body\n")
+        import yaml
+
+        frontmatter = yaml.safe_load(md.split("---\n")[1])
+        assert frontmatter["type"] == "concept"
+        assert frontmatter["status"] == "draft"
+        assert frontmatter["stale_after"] == "2030-01-01"
+        assert frontmatter["verified"][0]["by"] == "human:alice"
+        assert frontmatter["sources"] == [{"resource": "https://example.com"}]
+        assert frontmatter["owner"] == "team-a"
+        assert md.endswith("---\n# Body\n")
+
+    def test_rejects_unknown_status(self):
+        import pytest
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            OKFConcept(type="concept", status="archived")
