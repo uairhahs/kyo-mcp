@@ -16,3 +16,4 @@ wheels/
 *.db-wal
 *.sqlite
 *.sqlite3
+.coverage

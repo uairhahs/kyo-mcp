@@ -1,5 +1,4 @@
 # Generated artifacts
-!pkg/kyo_catalog.db
 *.db
 
 # local files
