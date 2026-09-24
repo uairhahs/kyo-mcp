@@ -286,3 +286,59 @@ class TestSyncAll:
         assert stats["total"] == 1
         assert get_hindsight_operation("n1") is None
         assert get_sync_hash("n1", "hindsight") == "hash-1"
+
+
+class TestBulkEfficiency:
+    @pytest.mark.asyncio
+    async def test_sync_all_shares_one_client(self, monkeypatch):
+        """Bulk sync reuses one HTTP client instead of opening a connection
+        per request, and submits every changed concept to Hindsight."""
+        import httpx
+        from kyo_mcp.database import create_concept
+
+        for i in range(12):
+            create_concept({"id": f"n{i}", "type": "concept", "title": f"Node {i}"})
+
+        opened = []
+        real_init = httpx.AsyncClient.__init__
+
+        def counting_init(self, *args, **kwargs):
+            opened.append(self)
+            real_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(httpx.AsyncClient, "__init__", counting_init)
+        with (
+            patch(
+                "httpx.AsyncClient.request",
+                new_callable=AsyncMock,
+                return_value=_mock_response(200, {}),
+            ) as request,
+            patch.object(
+                BridgeLayer, "sync_concept_to_mnemosyne", AsyncMock(return_value=True)
+            ),
+        ):
+            stats = await BridgeLayer().sync_all_concepts()
+
+        assert stats["total"] == 12
+        assert stats["hindsight_success"] == 12
+        assert stats["mnemosyne_success"] == 12
+        assert request.await_count == 12
+        assert len(opened) == 1
+
+    @pytest.mark.asyncio
+    async def test_unchanged_mnemosyne_sync_skips_import(self, monkeypatch):
+        """An unchanged concept must not pay the ~0.6s mnemosyne import."""
+        import sys
+
+        from kyo_mcp.bridge import _content_hash
+        from kyo_mcp.database import create_concept, set_sync_hash
+
+        create_concept(
+            {"id": "same", "type": "concept", "title": "T", "description": "D"}
+        )
+        set_sync_hash("same", "mnemosyne", _content_hash("T: D"))
+        # Makes any `import mnemosyne` raise ImportError.
+        monkeypatch.setitem(sys.modules, "mnemosyne", None)
+
+        concept = OKFConcept(id="same", type="concept", title="T", description="D")
+        assert await BridgeLayer().sync_concept_to_mnemosyne(concept) is True

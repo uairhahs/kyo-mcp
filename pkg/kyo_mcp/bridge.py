@@ -57,6 +57,11 @@ LLM_TIMEOUT = 180
 # Status polls don't touch the LLM pipeline, so they can fail fast.
 STATUS_TIMEOUT = 30
 
+# Cap on concurrent Hindsight requests during a bulk sync. Retains are
+# submitted with async=true, so each request only enqueues work; the cap
+# just keeps a large catalogue from opening hundreds of sockets at once.
+HINDSIGHT_CONCURRENCY = 8
+
 
 class BridgeLayer:
     """Bridge layer connecting OKF v0.2 to external memory systems.
@@ -124,6 +129,9 @@ class BridgeLayer:
         )
         self.hindsight_bank = hindsight_bank or os.environ.get("HINDSIGHT_BANK", "kyo")
         self.last_error: Optional[str] = None
+        # Shared client for bulk operations (see sync_all_concepts), so
+        # they reuse one connection instead of opening one per request.
+        self._client: Optional[httpx.AsyncClient] = None
 
     def _hindsight_headers(self) -> Dict[str, str]:
         """Auth header for a hosted Hindsight instance. Hindsight Cloud
@@ -147,13 +155,25 @@ class BridgeLayer:
         json: Optional[Dict[str, Any]] = None,
         timeout: float = LLM_TIMEOUT,
     ) -> httpx.Response:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            return await client.request(
-                method,
-                self._bank_url(path),
-                json=json,
-                headers=self._hindsight_headers(),
-            )
+        kwargs = {
+            "json": json,
+            "headers": self._hindsight_headers(),
+            "timeout": timeout,
+        }
+        if self._client is not None:
+            return await self._client.request(method, self._bank_url(path), **kwargs)
+        async with httpx.AsyncClient() as client:
+            return await client.request(method, self._bank_url(path), **kwargs)
+
+    async def _gather_limited(self, coros: List[Any]) -> List[Any]:
+        """Run coroutines concurrently, at most HINDSIGHT_CONCURRENCY at once."""
+        semaphore = asyncio.Semaphore(HINDSIGHT_CONCURRENCY)
+
+        async def limited(coro: Any) -> Any:
+            async with semaphore:
+                return await coro
+
+        return await asyncio.gather(*(limited(c) for c in coros))
 
     def _fail(self, message: str) -> None:
         self.last_error = message
@@ -169,9 +189,6 @@ class BridgeLayer:
             True if sync was successful, False otherwise
         """
         try:
-            # Import mnemosyne here to avoid dependency if not needed
-            from mnemosyne import remember
-
             # mnemosyne.remember()'s first argument must be a plain string:
             # it calls content.encode() internally, so passing a
             # structured dict here raises an AttributeError. Structured
@@ -186,6 +203,10 @@ class BridgeLayer:
                     f"Skipping {concept.id}: unchanged since last Mnemosyne sync"
                 )
                 return True
+
+            # Imported only once there is something to sync: the import
+            # alone takes ~0.6s, which an unchanged concept shouldn't pay.
+            from mnemosyne import remember
 
             # remember() is synchronous and may do disk or model work, so
             # it runs in a worker thread to keep the event loop free.
@@ -457,20 +478,43 @@ class BridgeLayer:
             "hindsight_completed": 0,
         }
         try:
-            for node_id in list_pending_hindsight_operations(db_path=self.db_path):
-                result = await self.check_hindsight_operation(node_id)
-                if result["state"] == "completed":
-                    stats["hindsight_completed"] += 1
+            concepts = [
+                OKFConcept.model_validate(c)
+                for c in query_catalog(db_path=self.db_path)
+            ]
+            stats["total"] = len(concepts)
 
-            for concept_data in query_catalog(db_path=self.db_path):
-                concept = OKFConcept.model_validate(concept_data)
-                stats["total"] += 1
+            async with httpx.AsyncClient() as client:
+                self._client = client
+                try:
+                    pending = list_pending_hindsight_operations(db_path=self.db_path)
+                    checks = await self._gather_limited(
+                        [self.check_hindsight_operation(n) for n in pending]
+                    )
+                    stats["hindsight_completed"] = sum(
+                        r["state"] == "completed" for r in checks
+                    )
 
-                if await self.sync_concept_to_mnemosyne(concept):
-                    stats["mnemosyne_success"] += 1
+                    # Hindsight submissions are independent network calls,
+                    # so they run concurrently. Mnemosyne's remember() runs
+                    # in a worker thread and isn't known to be thread-safe,
+                    # so those calls go one at a time alongside.
+                    async def mnemosyne_all() -> int:
+                        ok = 0
+                        for concept in concepts:
+                            ok += await self.sync_concept_to_mnemosyne(concept)
+                        return ok
 
-                if await self.sync_concept_to_hindsight(concept):
-                    stats["hindsight_success"] += 1
+                    mnemosyne_ok, hindsight_results = await asyncio.gather(
+                        mnemosyne_all(),
+                        self._gather_limited(
+                            [self.sync_concept_to_hindsight(c) for c in concepts]
+                        ),
+                    )
+                    stats["mnemosyne_success"] = mnemosyne_ok
+                    stats["hindsight_success"] = sum(hindsight_results)
+                finally:
+                    self._client = None
 
             logger.info(
                 f"Synced {stats['total']} concepts: {stats['mnemosyne_success']} to "
