@@ -102,9 +102,19 @@ def _hindsight_reachable() -> bool:
         return False
 
 
+# Opt-in only: these tests write real memories into the kyo-test bank and
+# queue real LLM fact extraction. Running them whenever Hindsight merely
+# happened to be reachable (e.g. from daishin) queued hundreds of retain jobs
+# that kept the single-slot LLM router busy for hours.
+INTEGRATION_ENABLED = os.environ.get("KYO_INTEGRATION_TESTS") == "1"
+
 pytestmark = pytest.mark.skipif(
-    not _hindsight_reachable(),
-    reason=f"Hindsight not reachable at {HINDSIGHT_BASE_URL}",
+    not INTEGRATION_ENABLED or not _hindsight_reachable(),
+    reason=(
+        "set KYO_INTEGRATION_TESTS=1 to run against a real Hindsight"
+        if not INTEGRATION_ENABLED
+        else f"Hindsight not reachable at {HINDSIGHT_BASE_URL}"
+    ),
 )
 
 

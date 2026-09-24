@@ -1,6 +1,16 @@
 """Tests for Mnemosyne integration with OKF v0.2."""
 
+import os
+
+import pytest
 from kyo_mcp.okf_schema import OKFConcept
+
+# Opt-in only: these call the real mnemosyne CLI, which stores test memories
+# in (and runs consolidation on) the user's actual Mnemosyne data.
+requires_integration = pytest.mark.skipif(
+    os.environ.get("KYO_INTEGRATION_TESTS") != "1",
+    reason="set KYO_INTEGRATION_TESTS=1 to run against the real Mnemosyne store",
+)
 
 
 class TestMnemosyneConnection:
@@ -22,6 +32,7 @@ class TestMnemosyneConnection:
         assert "Mnemosyne - Local AI Memory System" in result.stdout
 
 
+@requires_integration
 class TestOKFMnemosyneSync:
     """Test syncing OKF concepts to Mnemosyne via CLI."""
 
@@ -63,6 +74,7 @@ class TestOKFMnemosyneSync:
         assert result.returncode == 0
 
 
+@requires_integration
 class TestMnemosyneConsolidation:
     """Test Mnemosyne consolidation (sleep)."""
 
