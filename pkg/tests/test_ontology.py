@@ -39,10 +39,12 @@ class TestTypeMapping:
         uri = map_type_to_ontology("concept", "SKOS")
         assert uri == "skos:Concept"
 
-    def test_map_event_to_skos(self):
-        """Test mapping 'event' type to SKOS."""
-        uri = map_type_to_ontology("event", "SKOS")
-        assert uri == "skos:Event"
+    def test_event_has_no_skos_class(self):
+        """SKOS defines no Event class, so none is invented."""
+        assert map_type_to_ontology("event", "SKOS") is None
+
+    def test_map_event_to_dcmi_type(self):
+        assert map_type_to_ontology("event", "DublinCore") == "dcmitype:Event"
 
     def test_map_unknown_type(self):
         """Test mapping unknown type returns None."""
@@ -116,3 +118,27 @@ class TestRDFExport:
         )
         assert "dc:BibliographicResource" in rdf
         assert "dc:" in rdf
+
+
+class TestTurtleSyntax:
+    def test_single_terminated_statement(self):
+        """The description used to be appended after the statement's final
+        ".", producing invalid Turtle."""
+        rdf = export_to_rdf_turtle("t", "concept", "Title", description="Desc")
+        body = rdf.split("\n\n", 1)[1]
+        assert body.rstrip().endswith(" .")
+        assert body.count(" .") == 1
+        assert "skos:definition" in body
+
+    def test_prefixes_point_at_real_namespaces(self):
+        rdf = export_to_rdf_turtle("t", "concept", "Title")
+        assert "@prefix skos: <http://www.w3.org/2004/02/skos/core#> ." in rdf
+        assert "@prefix dc: <http://purl.org/dc/terms/> ." in rdf
+
+    def test_literals_are_escaped(self):
+        rdf = export_to_rdf_turtle("t", "concept", 'Say "hi"\\now\nplease')
+        assert '"Say \\"hi\\"\\\\now\\nplease"' in rdf
+
+    def test_ids_are_encoded_as_iris(self):
+        rdf = export_to_rdf_turtle("has space/slash", "concept", "T")
+        assert "<urn:kyo:has%20space%2Fslash>" in rdf

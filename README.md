@@ -1,4 +1,4 @@
-# Kyo 2.0 - Knowledge Graph MCP Server
+# Kyo - Knowledge Graph MCP Server
 
 **MCP 2026-07-28 | Mnemosyne | Hindsight | OKF v0.2**
 
@@ -33,8 +33,9 @@ Kyo (経) is a knowledge graph MCP server that implements Google's Open Knowledg
 - **MCP 2026-07-28**: Stateless protocol, MRTR, Streamable HTTP transport
 - **Mnemosyne Integration**: Spaced repetition for long-term knowledge retention
 - **Hindsight Integration**: AI-powered fact extraction and semantic search via a local LLM
-- **Ontology Layer**: SKOS/Dublin Core mappings with Turtle RDF export
-- **SQLite + NetworkX**: Lightweight graph storage without external dependencies
+- **Full-Text Search**: SQLite FTS5 over titles, descriptions, tags, and bodies, ranked by relevance
+- **Ontology Layer**: SKOS/DCMI type mappings with Turtle RDF export (`get_kyo_node` with `format="turtle"`)
+- **SQLite + NetworkX**: Lightweight graph storage and path finding without external services
 
 ## Quick Start
 
@@ -67,12 +68,13 @@ kyo/
 ├── pkg/
 │   ├── kyo_mcp/           # Core package
 │   │   ├── mcp_server.py  # MCP 2.0 server (MCPServer)
-│   │   ├── database.py    # SQLite schema + NetworkX graph
+│   │   ├── cli.py         # kyo-cli command
+│   │   ├── database.py    # SQLite schema, migrations, FTS5 search
 │   │   ├── okf_schema.py  # OKF v0.2 Pydantic models
 │   │   ├── ontology.py    # SKOS/Dublin Core + RDF export
 │   │   ├── bridge.py      # Mnemosyne + Hindsight sync
 │   │   └── __init__.py
-│   ├── tests/             # 106 tests (103 passing)
+│   ├── tests/             # Test suite
 │   ├── pyproject.toml
 │   └── README.md
 ├── docs/
@@ -83,19 +85,44 @@ kyo/
 
 ## MCP Tools
 
-| Tool                         | Description                            |
-| ---------------------------- | -------------------------------------- |
-| `create_kyo_node`            | Create OKF-compliant knowledge node    |
-| `link_kyo_nodes`             | Connect nodes with directed edges      |
-| `search_knowledge`           | Semantic search across catalogue       |
-| `verify_kyo_node`            | Mark node as human-reviewed            |
-| `get_node_trust_status`      | Get trust tier + provenance metadata   |
-| `sync_to_mnemosyne`          | Sync node to spaced repetition system  |
-| `sync_to_hindsight`          | Extract facts via local LLM            |
-| `recall_from_hindsight`      | Semantic search across synced concepts |
-| `trigger_reflection`         | Generate insights from knowledge base  |
-| `trigger_consolidation`      | Strengthen memory associations         |
-| `sync_all_to_memory_systems` | Batch sync all concepts                |
+| Tool                          | Description                                                      |
+| ----------------------------- | ---------------------------------------------------------------- |
+| `create_kyo_node`             | Create an OKF node (status, `stale_after`, sources, body)        |
+| `get_kyo_node`                | Get a node as an OKF markdown bundle file or as Turtle RDF       |
+| `update_kyo_node`             | Update some fields of a node, keeping its verification history   |
+| `delete_kyo_node`             | Delete a node and its links                                      |
+| `link_kyo_nodes`              | Connect two nodes with a directed, typed edge                    |
+| `unlink_kyo_nodes`            | Remove links between two nodes                                   |
+| `get_node_links`              | List a node's incoming and/or outgoing links                     |
+| `find_path`                   | Shortest chain of links between two nodes                        |
+| `search_knowledge`            | Full-text search over title, description, tags, and body         |
+| `verify_kyo_node`             | Mark a node as human-reviewed                                    |
+| `get_node_trust_status`       | Trust tier, freshness, and provenance metadata                   |
+| `sync_to_mnemosyne`           | Sync a node to the spaced repetition system                      |
+| `sync_to_hindsight`           | Queue a node for Hindsight fact extraction                       |
+| `check_hindsight_sync_status` | Check whether a queued Hindsight extraction has finished         |
+| `recall_from_hindsight`       | Semantic search across synced concepts                           |
+| `trigger_reflection`          | Generate insights from the knowledge base                        |
+| `trigger_consolidation`       | Strengthen memory associations                                   |
+| `sync_all_to_memory_systems`  | Sync every changed node, and check pending Hindsight extractions |
+
+Failures are returned as MCP tool errors (`isError: true`), not as
+successful results containing error text.
+
+## Configuration
+
+| Variable                 | Purpose                                                                                                                           |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| `KYO_DB_PATH`            | Full path of the SQLite database file                                                                                             |
+| `KYO_DATA_DIR`           | Directory for `kyo_catalog.db`, used when `KYO_DB_PATH` is unset (default: the platform user data dir, e.g. `~/.local/share/kyo`) |
+| `HINDSIGHT_API_BASE_URL` | Hindsight API URL (default: `http://localhost:8888`)                                                                              |
+| `HINDSIGHT_API_KEY`      | Bearer token for a Hindsight instance that requires auth                                                                          |
+| `HINDSIGHT_NAMESPACE`    | Hindsight namespace (default: `default`)                                                                                          |
+| `HINDSIGHT_BANK`         | Hindsight memory bank (default: `kyo`)                                                                                            |
+
+Every server process and the CLI can share one database; nothing is cached
+in memory, so writes from one are visible to the others immediately. The
+schema is migrated automatically on first open.
 
 ## Dependencies
 
@@ -103,9 +130,18 @@ kyo/
 - `networkx>=3.0`: Graph algorithms
 - `mnemosyne-memory>=3.0`: Spaced repetition
 - `pydantic>=2.0`: Data validation
+- `httpx`: Async HTTP for Hindsight (no Hindsight client library needed)
+- `platformdirs`, `pyyaml`
 
-Talking to Hindsight itself is done with plain HTTP (`requests`), so no
-Hindsight client library is a dependency here.
+## Running as a Service
+
+No system packaging ships with this repo. Build or run `pkg/` with uv
+(`uvx`, or `uv tool install` from the repo) and wrap it in whatever your
+system uses, e.g. a systemd unit running
+`kyo-mcp --transport streamable-http --host 127.0.0.1 --port 8000` with
+`KYO_DATA_DIR` pointing at a writable state directory. Note that nixpkgs'
+`mcp` is 1.x, too old for this server, so Nix users should build from
+`pkg/uv.lock` (e.g. with uv2nix) rather than from nixpkgs.
 
 ## Hindsight Setup
 

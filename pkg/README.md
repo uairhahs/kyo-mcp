@@ -58,33 +58,65 @@ Assumes Hindsight is reachable at `http://localhost:8888`; set
 
 ## MCP Tools
 
-| Tool                         | Description                               |
-| ---------------------------- | ----------------------------------------- |
-| `create_kyo_node`            | Create a new OKF-compliant knowledge node |
-| `link_kyo_nodes`             | Connect nodes with directed edges         |
-| `search_knowledge`           | Semantic search across the catalogue      |
-| `verify_kyo_node`            | Mark a node as human-verified             |
-| `get_node_trust_status`      | Get trust/provenance metadata             |
-| `sync_to_mnemosyne`          | Sync to spaced repetition system          |
-| `sync_to_hindsight`          | Sync for AI-powered fact extraction       |
-| `recall_from_hindsight`      | Semantic search via Hindsight             |
-| `trigger_reflection`         | Generate insights via Hindsight           |
-| `trigger_consolidation`      | Strengthen memory associations            |
-| `sync_all_to_memory_systems` | Batch sync all concepts                   |
+| Tool                          | Description                                                      |
+| ----------------------------- | ---------------------------------------------------------------- |
+| `create_kyo_node`             | Create an OKF node (status, `stale_after`, sources, body)        |
+| `get_kyo_node`                | Get a node as an OKF markdown bundle file or as Turtle RDF       |
+| `update_kyo_node`             | Update some fields of a node, keeping its verification history   |
+| `delete_kyo_node`             | Delete a node and its links                                      |
+| `link_kyo_nodes`              | Connect two nodes with a directed, typed edge                    |
+| `unlink_kyo_nodes`            | Remove links between two nodes                                   |
+| `get_node_links`              | List a node's incoming and/or outgoing links                     |
+| `find_path`                   | Shortest chain of links between two nodes                        |
+| `search_knowledge`            | Full-text search over title, description, tags, and body         |
+| `verify_kyo_node`             | Mark a node as human-reviewed                                    |
+| `get_node_trust_status`       | Trust tier, freshness, and provenance metadata                   |
+| `sync_to_mnemosyne`           | Sync a node to the spaced repetition system                      |
+| `sync_to_hindsight`           | Queue a node for Hindsight fact extraction                       |
+| `check_hindsight_sync_status` | Check whether a queued Hindsight extraction has finished         |
+| `recall_from_hindsight`       | Semantic search across synced concepts                           |
+| `trigger_reflection`          | Generate insights from the knowledge base                        |
+| `trigger_consolidation`       | Strengthen memory associations                                   |
+| `sync_all_to_memory_systems`  | Sync every changed node, and check pending Hindsight extractions |
+
+Failures are returned as MCP tool errors (`isError: true`), not as
+successful results containing error text.
 
 ## OKF v0.2 Compliance
 
 - **Trust Signals**: `generated` (always), optional `verified`, `sources`
-- **Freshness**: `stale_after` metadata
+- **Lifecycle**: `status` (`draft`, `stable`, `deprecated`)
+- **Freshness**: `stale_after`, reported as Fresh or Stale
 - **Provenance**: Tracking of node creation and verification
-- **Schema**: Pydantic models for OKF concepts
+- **Schema**: Pydantic models for OKF concepts, exported as OKF markdown bundle files
 
 ## Configuration
 
-Environment variables:
+| Variable                 | Purpose                                                                                                                           |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| `KYO_DB_PATH`            | Full path of the SQLite database file                                                                                             |
+| `KYO_DATA_DIR`           | Directory for `kyo_catalog.db`, used when `KYO_DB_PATH` is unset (default: the platform user data dir, e.g. `~/.local/share/kyo`) |
+| `HINDSIGHT_API_BASE_URL` | Hindsight API URL (default: `http://localhost:8888`)                                                                              |
+| `HINDSIGHT_API_KEY`      | Bearer token for a Hindsight instance that requires auth                                                                          |
+| `HINDSIGHT_NAMESPACE`    | Hindsight namespace (default: `default`)                                                                                          |
+| `HINDSIGHT_BANK`         | Hindsight memory bank (default: `kyo`)                                                                                            |
 
-- `KYO_DATA_DIR`: Directory for SQLite database (default: current directory)
-- `DATABASE_URL`: Database connection string (default: `sqlite:///kyo.db`)
+Every server process and the CLI can share one database; nothing is cached
+in memory, so writes from one are visible to the others immediately. The
+schema is migrated automatically on first open.
+
+## CLI
+
+The `kyo-cli` command works on the same database and prints JSON:
+
+```bash
+uv run kyo-cli create_concept "Title" "Summary" --content "# Markdown body"
+uv run kyo-cli search_concepts some words --limit 5
+uv run kyo-cli get_concept kyo-0123456789ab
+uv run kyo-cli sync_all
+```
+
+`python kyo_cli.py ...` still works as a compatibility shim.
 
 ## Project Structure
 
@@ -92,12 +124,13 @@ Environment variables:
 pkg/
 ├── kyo_mcp/
 │   ├── mcp_server.py       # MCP 2026-07-28 server (MCPServer)
-│   ├── database.py         # SQLite schema + NetworkX graph
+│   ├── cli.py              # kyo-cli command
+│   ├── database.py         # SQLite schema, migrations, FTS5 search
 │   ├── okf_schema.py       # OKF v0.2 Pydantic models
 │   ├── ontology.py         # SKOS/Dublin Core + RDF export
 │   ├── bridge.py           # Mnemosyne + Hindsight sync
 │   └── __init__.py
-├── tests/                  # Test suite (103 passing)
+├── tests/                  # Test suite
 ├── pyproject.toml
 └── README.md
 ```

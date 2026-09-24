@@ -13,15 +13,19 @@ Usage:
     await bridge.trigger_consolidation()
 """
 
+import asyncio
 import hashlib
 import logging
 import os
+import uuid
 from typing import Any, Dict, List, Optional
 
+import httpx
 from kyo_mcp.database import (
     clear_hindsight_operation,
     get_hindsight_operation,
     get_sync_hash,
+    list_pending_hindsight_operations,
     query_catalog,
     set_hindsight_operation,
     set_sync_hash,
@@ -42,13 +46,16 @@ def _content_hash(content: str) -> str:
 
 
 # Every call into Hindsight sets this timeout: without one, a slow or
-# overloaded backend leaves `requests.post()` waiting indefinitely rather
-# than failing, and every endpoint here touches Hindsight's LLM pipeline in
-# some way (extraction, embedding/reranking, reflection, consolidation), so
-# one generous timeout covers all of them. It is generous on purpose:
-# prompt processing on a large context, especially on a CPU-only backend,
-# can legitimately take well over a minute before generation even starts.
+# overloaded backend leaves a request waiting indefinitely rather than
+# failing, and every endpoint here touches Hindsight's LLM pipeline in some
+# way (extraction, embedding/reranking, reflection, consolidation), so one
+# generous timeout covers all of them. It is generous on purpose: prompt
+# processing on a large context, especially on a CPU-only backend, can
+# legitimately take well over a minute before generation even starts.
 LLM_TIMEOUT = 180
+
+# Status polls don't touch the LLM pipeline, so they can fail fast.
+STATUS_TIMEOUT = 30
 
 
 class BridgeLayer:
@@ -58,11 +65,20 @@ class BridgeLayer:
     - Mnemosyne (spaced repetition)
     - Hindsight (fact extraction, reflection, consolidation)
 
+    Every Hindsight call is made with httpx.AsyncClient, and Mnemosyne's
+    synchronous remember() runs in a worker thread, so a slow memory
+    system never blocks the MCP server's event loop (over streamable-http,
+    a blocking call here would stall every connected client).
+
     Attributes:
         db_path: Path to the SQLite database
         mnemosyne_config: Configuration for Mnemosyne integration
         hindsight_url: URL for Hindsight API (default: $HINDSIGHT_API_BASE_URL,
             falling back to http://localhost:8888)
+        hindsight_namespace / hindsight_bank: where memories are stored
+            (default: $HINDSIGHT_NAMESPACE or "default", $HINDSIGHT_BANK or "kyo")
+        last_error: description of the most recent failure, for callers
+            that need to report why a method returned False/empty
     """
 
     def __init__(
@@ -71,50 +87,77 @@ class BridgeLayer:
         mnemosyne_config: Optional[Dict[str, Any]] = None,
         hindsight_url: Optional[str] = None,
         hindsight_api_key: Optional[str] = None,
+        hindsight_namespace: Optional[str] = None,
+        hindsight_bank: Optional[str] = None,
     ):
         """Initialize the bridge layer.
 
         Args:
             db_path: Path to the SQLite database. Defaults to None, which
-                database.py's own get_connection() resolves to the real
-                appdirs-based DB_PATH. A literal string like "kyo.db" here
-                would be a different (and wrong) convention than the rest
-                of the codebase uses, and would silently point
-                sync_all_concepts at an empty database at a relative path,
-                since single-node sync tools never touch self.db_path but
-                sync_all_concepts's query_catalog(db_path=self.db_path)
-                call always does.
+                database.py resolves to its configured default. Pass it by
+                keyword to every database call: query_catalog's first
+                positional parameter is type_filter, not db_path.
             mnemosyne_config: Configuration for Mnemosyne integration
             hindsight_url: URL for Hindsight API. Defaults to the
-                HINDSIGHT_API_BASE_URL env var (matching
-                tests/test_hindsight_integration.py), then
-                http://localhost:8888.
+                HINDSIGHT_API_BASE_URL env var, then http://localhost:8888.
             hindsight_api_key: Bearer token for a hosted Hindsight instance
                 (e.g. Hindsight Cloud) that requires authentication.
                 Defaults to the HINDSIGHT_API_KEY env var, then None. A
                 self-hosted Hindsight has no auth of its own, so when this
-                is None, no Authorization header is sent at all, matching
-                every request this class made before this option existed.
+                is None, no Authorization header is sent at all.
+            hindsight_namespace: Hindsight namespace. Defaults to the
+                HINDSIGHT_NAMESPACE env var, then "default".
+            hindsight_bank: Hindsight memory bank. Defaults to the
+                HINDSIGHT_BANK env var, then "kyo".
         """
         self.db_path = db_path
         self.mnemosyne_config = mnemosyne_config or {}
-        self.hindsight_url = hindsight_url or os.environ.get(
-            "HINDSIGHT_API_BASE_URL", "http://localhost:8888"
-        )
+        self.hindsight_url = (
+            hindsight_url
+            or os.environ.get("HINDSIGHT_API_BASE_URL", "http://localhost:8888")
+        ).rstrip("/")
         self.hindsight_api_key = hindsight_api_key or os.environ.get(
             "HINDSIGHT_API_KEY"
         )
+        self.hindsight_namespace = hindsight_namespace or os.environ.get(
+            "HINDSIGHT_NAMESPACE", "default"
+        )
+        self.hindsight_bank = hindsight_bank or os.environ.get("HINDSIGHT_BANK", "kyo")
+        self.last_error: Optional[str] = None
 
     def _hindsight_headers(self) -> Dict[str, str]:
         """Auth header for a hosted Hindsight instance. Hindsight Cloud
-        (api.hindsight.vectorize.io) requires `Authorization: Bearer
-        <key>`; self-hosted Hindsight declares no security scheme at all
-        in its own OpenAPI spec, so when no key is configured this returns
-        an empty dict and every call sends no Authorization header,
-        unchanged from before this option existed."""
+        requires `Authorization: Bearer <key>`; self-hosted Hindsight
+        declares no security scheme at all, so when no key is configured
+        this returns an empty dict and no Authorization header is sent."""
         if self.hindsight_api_key:
             return {"Authorization": f"Bearer {self.hindsight_api_key}"}
         return {}
+
+    def _bank_url(self, path: str) -> str:
+        return (
+            f"{self.hindsight_url}/v1/{self.hindsight_namespace}"
+            f"/banks/{self.hindsight_bank}/{path}"
+        )
+
+    async def _hindsight_request(
+        self,
+        method: str,
+        path: str,
+        json: Optional[Dict[str, Any]] = None,
+        timeout: float = LLM_TIMEOUT,
+    ) -> httpx.Response:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            return await client.request(
+                method,
+                self._bank_url(path),
+                json=json,
+                headers=self._hindsight_headers(),
+            )
+
+    def _fail(self, message: str) -> None:
+        self.last_error = message
+        logger.error(message)
 
     async def sync_concept_to_mnemosyne(self, concept: OKFConcept) -> bool:
         """Sync an OKF concept to Mnemosyne for spaced repetition.
@@ -135,12 +178,8 @@ class BridgeLayer:
             # fields belong in the separate `metadata` parameter.
             content = f"{concept.title}: {concept.description or ''}"
 
-            # Skip if this exact content was already synced. Without this,
-            # sync_all_concepts resynced every node on every call, and
-            # since each resync re-runs a non-deterministic LLM extraction,
-            # Hindsight's own dedup (matched on text similarity) doesn't
-            # always recognize repeats of an unchanged concept as the same
-            # thing, letting near-duplicate facts pile up.
+            # Skip if this exact content was already synced, rather than
+            # storing a duplicate memory on every sync_all call.
             new_hash = _content_hash(content)
             if get_sync_hash(concept.id, "mnemosyne", db_path=self.db_path) == new_hash:
                 logger.info(
@@ -148,9 +187,10 @@ class BridgeLayer:
                 )
                 return True
 
-            # remember() is synchronous (returns str, not a coroutine),
-            # unlike this method's own async signature, so no await here.
-            remember(
+            # remember() is synchronous and may do disk or model work, so
+            # it runs in a worker thread to keep the event loop free.
+            await asyncio.to_thread(
+                remember,
                 content,
                 metadata={
                     "okf_id": concept.id,
@@ -166,27 +206,19 @@ class BridgeLayer:
             return True
 
         except Exception as e:
-            logger.error(f"Failed to sync concept {concept.id} to Mnemosyne: {e}")
+            self._fail(f"Failed to sync concept {concept.id} to Mnemosyne: {e}")
             return False
 
     async def sync_concept_to_hindsight(self, concept: OKFConcept) -> bool:
         """Submit an OKF concept to Hindsight for fact extraction.
 
-        This used to POST with Hindsight's default async=false, blocking on
-        the full extraction pipeline synchronously. On a slow or
-        CPU-bound backend, a single retain call can legitimately take far
-        longer than this method's own LLM_TIMEOUT, so the `requests.post()`
-        reliably raised a client-side timeout and every such call was
-        reported as "failed" regardless of whether Hindsight would have
-        eventually finished it. Hindsight's own /memories endpoint already
-        supports `async=true` + a client-supplied
-        `operation_id` (idempotent: resubmitting the same id against
-        unchanged content returns the existing operation rather than
-        enqueuing a duplicate) plus a GET .../operations/{operation_id} to
-        poll status; see check_hindsight_operation below. Submission with
-        async=true returns as soon as Hindsight has enqueued the work, so
-        this call is now fast regardless of how long extraction itself
-        takes; the underlying LLM call is no longer this method's problem.
+        Submits with Hindsight's `async=true` retain mode, which returns as
+        soon as the work is enqueued. A synchronous retain blocks on the
+        full extraction pipeline, which on a slow or CPU-bound backend
+        takes far longer than LLM_TIMEOUT, so it was reliably reported as
+        failed regardless of whether Hindsight eventually finished it.
+        The client-supplied `operation_id` makes resubmission idempotent,
+        and check_hindsight_operation polls it for completion.
 
         Args:
             concept: The OKF concept to sync
@@ -198,10 +230,6 @@ class BridgeLayer:
             check_hindsight_operation to find out when it has.
         """
         try:
-            import uuid
-
-            import requests
-
             # Prepare content for Hindsight
             content = f"{concept.title}: {concept.description or ''}"
             if concept.tags:
@@ -217,10 +245,8 @@ class BridgeLayer:
                 return True
 
             # Skip if there's already an in-flight submission for this exact
-            # content, otherwise every retry before the first one resolves
-            # would submit a fresh operation_id (since it's derived from
-            # new_hash below, a *stale* one wouldn't collide, just duplicate
-            # the work).
+            # content, so retries before the first one resolves don't
+            # duplicate the work.
             existing = get_hindsight_operation(concept.id, db_path=self.db_path)
             if existing and existing[1] == new_hash:
                 logger.info(
@@ -230,19 +256,18 @@ class BridgeLayer:
                 return True
 
             # Deterministic, not random: resubmitting the same content for
-            # the same node after a lost/ambiguous response (e.g. this
-            # process died after Hindsight accepted the request but before
-            # it recorded the operation_id locally) reuses the same id.
-            # Hindsight treats that as "return the existing operation," not
-            # a duplicate: reusing an id against genuinely *different*
-            # content would instead get HTTP 409, which is exactly why this
-            # is derived from new_hash rather than concept.id alone.
+            # the same node after a lost/ambiguous response reuses the same
+            # id, which Hindsight treats as "return the existing
+            # operation". Reusing an id against different content gets
+            # HTTP 409 instead, which is why this is derived from new_hash
+            # rather than concept.id alone.
             operation_id = str(
                 uuid.uuid5(uuid.NAMESPACE_URL, f"kyo-hindsight:{concept.id}:{new_hash}")
             )
 
-            response = requests.post(
-                f"{self.hindsight_url}/v1/default/banks/kyo/memories",
+            response = await self._hindsight_request(
+                "POST",
+                "memories",
                 json={
                     "items": [
                         {
@@ -254,8 +279,6 @@ class BridgeLayer:
                     "async": True,
                     "operation_id": operation_id,
                 },
-                headers=self._hindsight_headers(),
-                timeout=LLM_TIMEOUT,
             )
 
             if response.status_code in [200, 201]:
@@ -266,14 +289,11 @@ class BridgeLayer:
                     f"Queued concept {concept.id} to Hindsight as operation {operation_id}"
                 )
                 return True
-            else:
-                logger.error(
-                    f"Hindsight API error: {response.status_code} - {response.text}"
-                )
-                return False
+            self._fail(f"Hindsight API error: {response.status_code} - {response.text}")
+            return False
 
         except Exception as e:
-            logger.error(f"Failed to submit concept {concept.id} to Hindsight: {e}")
+            self._fail(f"Failed to submit concept {concept.id} to Hindsight: {e}")
             return False
 
     async def check_hindsight_operation(self, node_id: str) -> Dict[str, Any]:
@@ -303,12 +323,8 @@ class BridgeLayer:
         operation_id, pending_hash = pending
 
         try:
-            import requests
-
-            response = requests.get(
-                f"{self.hindsight_url}/v1/default/banks/kyo/operations/{operation_id}",
-                headers=self._hindsight_headers(),
-                timeout=30,
+            response = await self._hindsight_request(
+                "GET", f"operations/{operation_id}", timeout=STATUS_TIMEOUT
             )
             if response.status_code != 200:
                 return {
@@ -357,13 +373,8 @@ class BridgeLayer:
             List of matching memories
         """
         try:
-            import requests
-
-            response = requests.post(
-                f"{self.hindsight_url}/v1/default/banks/kyo/memories/recall",
-                json={"query": query, "top_k": top_k},
-                headers=self._hindsight_headers(),
-                timeout=LLM_TIMEOUT,
+            response = await self._hindsight_request(
+                "POST", "memories/recall", json={"query": query, "top_k": top_k}
             )
 
             if response.status_code == 200:
@@ -376,14 +387,11 @@ class BridgeLayer:
                 # Ranking itself is fine, so slicing here is sufficient;
                 # the real fix belongs upstream in hindsight-api.
                 return results[:top_k]
-            else:
-                logger.error(
-                    f"Hindsight API error: {response.status_code} - {response.text}"
-                )
-                return []
+            self._fail(f"Hindsight API error: {response.status_code} - {response.text}")
+            return []
 
         except Exception as e:
-            logger.error(f"Failed to recall from Hindsight: {e}")
+            self._fail(f"Failed to recall from Hindsight: {e}")
             return []
 
     async def trigger_reflection(self, query: str) -> Dict[str, Any]:
@@ -396,25 +404,17 @@ class BridgeLayer:
             Reflection results
         """
         try:
-            import requests
-
-            response = requests.post(
-                f"{self.hindsight_url}/v1/default/banks/kyo/reflect",
-                json={"query": query, "mode": "observations"},
-                headers=self._hindsight_headers(),
-                timeout=LLM_TIMEOUT,
+            response = await self._hindsight_request(
+                "POST", "reflect", json={"query": query, "mode": "observations"}
             )
 
             if response.status_code == 200:
                 return response.json()
-            else:
-                logger.error(
-                    f"Hindsight API error: {response.status_code} - {response.text}"
-                )
-                return {}
+            self._fail(f"Hindsight API error: {response.status_code} - {response.text}")
+            return {}
 
         except Exception as e:
-            logger.error(f"Failed to trigger reflection: {e}")
+            self._fail(f"Failed to trigger reflection: {e}")
             return {}
 
     async def trigger_consolidation(self) -> bool:
@@ -424,62 +424,60 @@ class BridgeLayer:
             True if consolidation was triggered successfully
         """
         try:
-            import requests
-
-            response = requests.post(
-                f"{self.hindsight_url}/v1/default/banks/kyo/consolidate",
-                json={"mode": "full"},
-                headers=self._hindsight_headers(),
-                timeout=LLM_TIMEOUT,
+            response = await self._hindsight_request(
+                "POST", "consolidate", json={"mode": "full"}
             )
 
             if response.status_code in [200, 202]:
                 logger.info("Consolidation triggered successfully")
                 return True
-            else:
-                logger.error(
-                    f"Hindsight API error: {response.status_code} - {response.text}"
-                )
-                return False
+            self._fail(f"Hindsight API error: {response.status_code} - {response.text}")
+            return False
 
         except Exception as e:
-            logger.error(f"Failed to trigger consolidation: {e}")
+            self._fail(f"Failed to trigger consolidation: {e}")
             return False
 
     async def sync_all_concepts(self) -> Dict[str, int]:
         """Sync all concepts from the database to external systems.
 
+        In-flight Hindsight operations are polled first, so any that have
+        completed since the last run are recorded as synced and not
+        resubmitted.
+
         Returns:
-            Dictionary with counts of successful/failed syncs
+            Dictionary of counts: total, mnemosyne_success,
+            hindsight_success (queued or already current), and
+            hindsight_completed (in-flight operations found finished)
         """
+        stats = {
+            "total": 0,
+            "mnemosyne_success": 0,
+            "hindsight_success": 0,
+            "hindsight_completed": 0,
+        }
         try:
-            # Query all concepts from the database. Must be a keyword
-            # arg: query_catalog's first positional parameter is
-            # type_filter, not db_path, so passing self.db_path
-            # positionally would filter on
-            # type = '<the db file path string>' and silently match zero
-            # rows every time.
-            concepts = query_catalog(db_path=self.db_path)
+            for node_id in list_pending_hindsight_operations(db_path=self.db_path):
+                result = await self.check_hindsight_operation(node_id)
+                if result["state"] == "completed":
+                    stats["hindsight_completed"] += 1
 
-            stats = {"total": 0, "mnemosyne_success": 0, "hindsight_success": 0}
-
-            for concept_data in concepts:
+            for concept_data in query_catalog(db_path=self.db_path):
                 concept = OKFConcept.model_validate(concept_data)
                 stats["total"] += 1
 
-                # Sync to Mnemosyne
                 if await self.sync_concept_to_mnemosyne(concept):
                     stats["mnemosyne_success"] += 1
 
-                # Sync to Hindsight
                 if await self.sync_concept_to_hindsight(concept):
                     stats["hindsight_success"] += 1
 
             logger.info(
-                f"Synced {stats['total']} concepts: {stats['mnemosyne_success']} to Mnemosyne, {stats['hindsight_success']} to Hindsight"
+                f"Synced {stats['total']} concepts: {stats['mnemosyne_success']} to "
+                f"Mnemosyne, {stats['hindsight_success']} to Hindsight"
             )
             return stats
 
         except Exception as e:
-            logger.error(f"Failed to sync all concepts: {e}")
-            return {"total": 0, "mnemosyne_success": 0, "hindsight_success": 0}
+            self._fail(f"Failed to sync all concepts: {e}")
+            return stats

@@ -1,18 +1,17 @@
 """Unit tests for BridgeLayer's Hindsight HTTP calls.
 
 Unlike test_hindsight_integration.py (which calls the real Hindsight API
-directly and skips if none is reachable), these mock every `requests`
-call, so they always run and never touch a network. They exist mainly to
+directly and skips if none is reachable), these mock every httpx
+request, so they always run and never touch a network. They exist mainly to
 guard the optional Authorization header for a hosted Hindsight instance
-(e.g. Hindsight Cloud, which requires `Authorization: Bearer <key>`):
-since bridge.py builds each requests.post/get call individually rather
-than through one shared client, a future edit to any one call site could
-silently forget to wire the header through, or (the regression that
-actually matters) send it when no key is configured, breaking every
-self-hosted Hindsight deployment that has no auth of its own.
+(e.g. Hindsight Cloud, which requires `Authorization: Bearer <key>`): a
+future edit to any one call site could silently forget to wire the header
+through, or (the regression that actually matters) send it when no key is
+configured, breaking every self-hosted Hindsight deployment that has no
+auth of its own.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from kyo_mcp.bridge import BridgeLayer
@@ -76,7 +75,9 @@ class TestHindsightCallsSendCorrectHeaders:
         monkeypatch.delenv("HINDSIGHT_API_KEY", raising=False)
         bridge = BridgeLayer(hindsight_api_key=None)
         with patch(
-            "requests.post", return_value=_mock_response(200, {"success": True})
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            return_value=_mock_response(200, {"success": True}),
         ) as mock_post:
             await bridge.sync_concept_to_hindsight(_concept())
         assert mock_post.call_args.kwargs["headers"] == {}
@@ -85,7 +86,9 @@ class TestHindsightCallsSendCorrectHeaders:
     async def test_sync_concept_to_hindsight_with_key(self):
         bridge = BridgeLayer(hindsight_api_key="hsk_test123")
         with patch(
-            "requests.post", return_value=_mock_response(200, {"success": True})
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            return_value=_mock_response(200, {"success": True}),
         ) as mock_post:
             await bridge.sync_concept_to_hindsight(_concept())
         assert mock_post.call_args.kwargs["headers"] == {
@@ -102,7 +105,8 @@ class TestHindsightCallsSendCorrectHeaders:
                 return_value=("op-123", "hash-abc"),
             ),
             patch(
-                "requests.get",
+                "httpx.AsyncClient.request",
+                new_callable=AsyncMock,
                 return_value=_mock_response(200, {"status": "pending"}),
             ) as mock_get,
         ):
@@ -118,7 +122,8 @@ class TestHindsightCallsSendCorrectHeaders:
                 return_value=("op-123", "hash-abc"),
             ),
             patch(
-                "requests.get",
+                "httpx.AsyncClient.request",
+                new_callable=AsyncMock,
                 return_value=_mock_response(200, {"status": "pending"}),
             ) as mock_get,
         ):
@@ -132,7 +137,9 @@ class TestHindsightCallsSendCorrectHeaders:
         monkeypatch.delenv("HINDSIGHT_API_KEY", raising=False)
         bridge = BridgeLayer(hindsight_api_key=None)
         with patch(
-            "requests.post", return_value=_mock_response(200, {"results": []})
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            return_value=_mock_response(200, {"results": []}),
         ) as mock_post:
             await bridge.recall_from_hindsight("query")
         assert mock_post.call_args.kwargs["headers"] == {}
@@ -141,7 +148,9 @@ class TestHindsightCallsSendCorrectHeaders:
     async def test_recall_from_hindsight_with_key(self):
         bridge = BridgeLayer(hindsight_api_key="hsk_test123")
         with patch(
-            "requests.post", return_value=_mock_response(200, {"results": []})
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            return_value=_mock_response(200, {"results": []}),
         ) as mock_post:
             await bridge.recall_from_hindsight("query")
         assert mock_post.call_args.kwargs["headers"] == {
@@ -153,7 +162,9 @@ class TestHindsightCallsSendCorrectHeaders:
         monkeypatch.delenv("HINDSIGHT_API_KEY", raising=False)
         bridge = BridgeLayer(hindsight_api_key=None)
         with patch(
-            "requests.post", return_value=_mock_response(200, {"observations": []})
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            return_value=_mock_response(200, {"observations": []}),
         ) as mock_post:
             await bridge.trigger_reflection("query")
         assert mock_post.call_args.kwargs["headers"] == {}
@@ -162,7 +173,9 @@ class TestHindsightCallsSendCorrectHeaders:
     async def test_trigger_reflection_with_key(self):
         bridge = BridgeLayer(hindsight_api_key="hsk_test123")
         with patch(
-            "requests.post", return_value=_mock_response(200, {"observations": []})
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            return_value=_mock_response(200, {"observations": []}),
         ) as mock_post:
             await bridge.trigger_reflection("query")
         assert mock_post.call_args.kwargs["headers"] == {
@@ -174,7 +187,9 @@ class TestHindsightCallsSendCorrectHeaders:
         monkeypatch.delenv("HINDSIGHT_API_KEY", raising=False)
         bridge = BridgeLayer(hindsight_api_key=None)
         with patch(
-            "requests.post", return_value=_mock_response(200, {})
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            return_value=_mock_response(200, {}),
         ) as mock_post:
             await bridge.trigger_consolidation()
         assert mock_post.call_args.kwargs["headers"] == {}
@@ -183,9 +198,91 @@ class TestHindsightCallsSendCorrectHeaders:
     async def test_trigger_consolidation_with_key(self):
         bridge = BridgeLayer(hindsight_api_key="hsk_test123")
         with patch(
-            "requests.post", return_value=_mock_response(200, {})
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            return_value=_mock_response(200, {}),
         ) as mock_post:
             await bridge.trigger_consolidation()
         assert mock_post.call_args.kwargs["headers"] == {
             "Authorization": "Bearer hsk_test123"
         }
+
+
+class TestHindsightLocation:
+    """The namespace and bank used to be hardcoded as default/kyo."""
+
+    def test_defaults(self, monkeypatch):
+        monkeypatch.delenv("HINDSIGHT_NAMESPACE", raising=False)
+        monkeypatch.delenv("HINDSIGHT_BANK", raising=False)
+        bridge = BridgeLayer(hindsight_url="http://h:8888/")
+        assert (
+            bridge._bank_url("memories")
+            == "http://h:8888/v1/default/banks/kyo/memories"
+        )
+
+    def test_env_overrides(self, monkeypatch):
+        monkeypatch.setenv("HINDSIGHT_NAMESPACE", "team")
+        monkeypatch.setenv("HINDSIGHT_BANK", "notes")
+        bridge = BridgeLayer(hindsight_url="http://h:8888")
+        assert (
+            bridge._bank_url("reflect") == "http://h:8888/v1/team/banks/notes/reflect"
+        )
+
+
+class TestErrorReporting:
+    @pytest.mark.asyncio
+    async def test_http_error_sets_last_error(self):
+        bridge = BridgeLayer()
+        with patch(
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            return_value=_mock_response(500, text="boom"),
+        ):
+            assert await bridge.trigger_consolidation() is False
+        assert "500" in bridge.last_error and "boom" in bridge.last_error
+
+    @pytest.mark.asyncio
+    async def test_network_error_sets_last_error(self):
+        import httpx
+
+        bridge = BridgeLayer()
+        with patch(
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            side_effect=httpx.ConnectError("refused"),
+        ):
+            assert await bridge.recall_from_hindsight("q") == []
+        assert "refused" in bridge.last_error
+
+
+class TestSyncAll:
+    @pytest.mark.asyncio
+    async def test_polls_pending_operations_first(self):
+        from kyo_mcp.database import (
+            create_concept,
+            get_hindsight_operation,
+            get_sync_hash,
+            set_hindsight_operation,
+        )
+
+        create_concept({"id": "n1", "type": "concept", "title": "One"})
+        set_hindsight_operation("n1", "op-1", "hash-1")
+        bridge = BridgeLayer()
+        with (
+            patch(
+                "httpx.AsyncClient.request",
+                new_callable=AsyncMock,
+                return_value=_mock_response(200, {"status": "completed"}),
+            ),
+            patch.object(
+                BridgeLayer, "sync_concept_to_mnemosyne", AsyncMock(return_value=True)
+            ),
+            patch.object(
+                BridgeLayer, "sync_concept_to_hindsight", AsyncMock(return_value=True)
+            ),
+        ):
+            stats = await bridge.sync_all_concepts()
+        assert stats["hindsight_completed"] == 1
+        assert stats["total"] == 1
+        assert get_hindsight_operation("n1") is None
+        assert get_sync_hash("n1", "hindsight") == "hash-1"
