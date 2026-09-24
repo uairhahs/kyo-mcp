@@ -133,12 +133,15 @@ schema is migrated automatically on first open.
 - `httpx`: Async HTTP for Hindsight (no Hindsight client library needed)
 - `platformdirs`, `pyyaml`
 
-## NixOS
+## Running as a Service
 
-`nix/kyo.nix` is a NixOS module that runs the server over streamable HTTP
-as a systemd service, with its database in `/var/lib/kyo`. Set
-`services.kyo.package` to a kyo-mcp build with its locked dependencies
-(nixpkgs' `mcp` is 1.x, too old for this server).
+No system packaging ships with this repo. Build or run `pkg/` with uv
+(`uvx`, or `uv tool install` from the repo) and wrap it in whatever your
+system uses, e.g. a systemd unit running
+`kyo-mcp --transport streamable-http --host 127.0.0.1 --port 8000` with
+`KYO_DATA_DIR` pointing at a writable state directory. Note that nixpkgs'
+`mcp` is 1.x, too old for this server, so Nix users should build from
+`pkg/uv.lock` (e.g. with uv2nix) rather than from nixpkgs.
 
 ## Hindsight Setup
 

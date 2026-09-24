@@ -25,7 +25,6 @@ lint:
     - git-diff-check
     - isort@9.0.1
     - markdownlint@0.49.1
-    - nixpkgs-fmt@1.3.0
     - oxipng@10.2.1
     - prettier@3.9.8
     - ruff@0.16.8
