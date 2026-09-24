@@ -1,24 +1,37 @@
 """Tests for MCP server tools."""
 
+import re
+
 import pytest
+from kyo_mcp.database import get_concept_by_id
 from kyo_mcp.mcp_server import (
-    G,
-    QueryInput,
     create_kyo_node,
+    delete_kyo_node,
+    find_path,
+    get_kyo_node,
+    get_node_links,
     get_node_trust_status,
+    is_stale,
     link_kyo_nodes,
-    load_graph_data,
     search_knowledge,
+    unlink_kyo_nodes,
+    update_kyo_node,
     verify_kyo_node,
 )
+from mcp.server.mcpserver.exceptions import ToolError
 
 
-@pytest.fixture(autouse=True)
-def reset_graph():
-    """Reset the in-memory graph between tests."""
-    G.clear()
-    yield
-    G.clear()
+def node_id_of(result: str) -> str:
+    """Extract the id from "Node created successfully: <id> (<title>) | ..."."""
+    return re.search(r"successfully: (\S+) \(", result).group(1)
+
+
+async def make_node(title: str, **kwargs) -> str:
+    return node_id_of(
+        await create_kyo_node(
+            title=title, description=kwargs.pop("description", "Test"), **kwargs
+        )
+    )
 
 
 class TestCreateKyoNode:
@@ -30,120 +43,255 @@ class TestCreateKyoNode:
             concept_type="concept",
         )
         assert "Node created successfully" in result
-        assert "kyo-node-" in result
+        assert "kyo-" in result
 
     @pytest.mark.asyncio
     async def test_create_node_with_tags(self):
-        result = await create_kyo_node(
-            title="Tagged Node",
-            description="With tags",
-            tags=["test", "example"],
-        )
-        assert "Node created successfully" in result
+        node_id = await make_node("Tagged Node", tags=["test", "example"])
+        assert get_concept_by_id(node_id)["tags"] == ["test", "example"]
 
     @pytest.mark.asyncio
     async def test_create_node_with_source(self):
-        result = await create_kyo_node(
-            title="Sourced Node",
-            description="With source",
+        node_id = await make_node(
+            "Sourced Node",
             sources=[
                 {"id": "src-1", "resource": "https://example.com", "title": "Doc"}
             ],
         )
-        assert "Node created successfully" in result
+        assert (
+            get_concept_by_id(node_id)["sources"][0]["resource"]
+            == "https://example.com"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stale_after_is_persisted(self):
+        """Regression: stale_after used to be silently dropped on save."""
+        node_id = await make_node("Fresh Until", stale_after="2030-01-01")
+        assert get_concept_by_id(node_id)["stale_after"] == "2030-01-01"
+
+    @pytest.mark.asyncio
+    async def test_ids_are_unique_across_processes(self):
+        """Regression: ids came from the in-memory node count, so two server
+        processes sharing a database produced the same id and the second
+        create silently overwrote the first node."""
+        ids = {await make_node(f"Node {i}") for i in range(20)}
+        assert len(ids) == 20
+        for node_id in ids:
+            assert get_concept_by_id(node_id) is not None
+
+
+class TestGetKyoNode:
+    @pytest.mark.asyncio
+    async def test_markdown(self):
+        node_id = await make_node("Doc Node", tags=["a"], stale_after="2030-01-01")
+        md = await get_kyo_node(node_id)
+        assert md.startswith("---\ntype: concept\n")
+        assert "stale_after: '2030-01-01'" in md
+        assert "process:kyo-mcp" in md
+
+    @pytest.mark.asyncio
+    async def test_markdown_lists_links(self):
+        a = await make_node("A")
+        b = await make_node("B")
+        await link_kyo_nodes(a, b, "references")
+        md = await get_kyo_node(a)
+        assert f"{a} -[references]-> {b}" in md
+
+    @pytest.mark.asyncio
+    async def test_turtle(self):
+        a = await make_node('A "quoted"')
+        b = await make_node("B")
+        await link_kyo_nodes(a, b, "references")
+        ttl = await get_kyo_node(a, format="turtle")
+        assert f"<urn:kyo:{a}> a skos:Concept" in ttl
+        assert '"A \\"quoted\\""' in ttl
+        assert f"<urn:kyo:relation:references> <urn:kyo:{b}>" in ttl
+
+    @pytest.mark.asyncio
+    async def test_missing(self):
+        with pytest.raises(ToolError, match="not found"):
+            await get_kyo_node("nope")
+
+
+class TestUpdateAndDelete:
+    @pytest.mark.asyncio
+    async def test_update_fields(self):
+        node_id = await make_node("Old Title")
+        await update_kyo_node(node_id, title="New Title", status="deprecated")
+        node = get_concept_by_id(node_id)
+        assert node["title"] == "New Title"
+        assert node["status"] == "deprecated"
+        assert node["description"] == "Test"
+
+    @pytest.mark.asyncio
+    async def test_update_keeps_verification(self):
+        node_id = await make_node("Verified Then Edited")
+        await verify_kyo_node(node_id, "alice")
+        await update_kyo_node(node_id, description="Edited")
+        assert "Human-Reviewed" in await get_node_trust_status(node_id)
+
+    @pytest.mark.asyncio
+    async def test_update_nothing(self):
+        node_id = await make_node("Untouched")
+        with pytest.raises(ToolError, match="Nothing to update"):
+            await update_kyo_node(node_id)
+
+    @pytest.mark.asyncio
+    async def test_delete_removes_links(self):
+        a = await make_node("A")
+        b = await make_node("B")
+        await link_kyo_nodes(a, b, "references")
+        await delete_kyo_node(b)
+        assert get_concept_by_id(b) is None
+        assert "no both links" in await get_node_links(a)
+
+    @pytest.mark.asyncio
+    async def test_delete_missing(self):
+        with pytest.raises(ToolError):
+            await delete_kyo_node("nope")
 
 
 class TestSearchKnowledge:
     @pytest.mark.asyncio
     async def test_search_empty(self):
-        query = QueryInput(search_term="nonexistent")
-        result = await search_knowledge(query)
+        result = await search_knowledge(search_term="nonexistent")
         assert "Found 0 result(s)" in result
 
     @pytest.mark.asyncio
     async def test_search_after_create(self):
-        await create_kyo_node(title="Searchable Node", description="Test")
-        query = QueryInput(search_term="Searchable")
-        result = await search_knowledge(query)
+        await make_node("Searchable Node")
+        result = await search_knowledge(search_term="Searchable")
         assert "Searchable Node" in result
 
     @pytest.mark.asyncio
     async def test_search_by_type(self):
-        await create_kyo_node(
-            title="Type Test", description="Test", concept_type="dataset"
-        )
-        query = QueryInput(search_term="Type Test", concept_type="dataset")
-        result = await search_knowledge(query)
+        await make_node("Type Test", concept_type="dataset")
+        result = await search_knowledge(search_term="Type Test", concept_type="dataset")
         assert "dataset" in result
 
+    @pytest.mark.asyncio
+    async def test_search_matches_description_and_tags(self):
+        await make_node(
+            "Plain", description="talks about photosynthesis", tags=["botany"]
+        )
+        assert "Plain" in await search_knowledge(search_term="photosynthesis")
+        assert "Plain" in await search_knowledge(search_term="botany")
 
-class TestLinkKyoNodes:
+    @pytest.mark.asyncio
+    async def test_search_survives_fts_syntax(self):
+        await make_node('Weird "quote" - AND OR')
+        result = await search_knowledge(search_term='"quote" - AND (')
+        assert "Found" in result
+
+    @pytest.mark.asyncio
+    async def test_limit(self):
+        for i in range(5):
+            await make_node(f"Many {i}")
+        result = await search_knowledge(search_term="Many", limit=2)
+        assert "Found 2 result(s)" in result
+
+
+class TestLinks:
     @pytest.mark.asyncio
     async def test_link_nodes(self):
-        node1 = await create_kyo_node(title="Source", description="Source")
-        node2 = await create_kyo_node(title="Target", description="Target")
-        # Extract node IDs from response (format: "Node created successfully (kyo-node-xxx)")
-        source_id = node1.split(": ")[1].split(" (")[0]
-        target_id = node2.split(": ")[1].split(" (")[0]
-        result = await link_kyo_nodes(source_id, target_id, "references")
-        assert f"{source_id} -> {target_id}" in result
+        a = await make_node("Source")
+        b = await make_node("Target")
+        result = await link_kyo_nodes(a, b, "references")
+        assert f"{a} -> {b}" in result
 
     @pytest.mark.asyncio
     async def test_link_invalid_nodes(self):
-        result = await link_kyo_nodes("nonexistent", "also-nonexistent", "references")
-        assert "Error" in result
+        with pytest.raises(ToolError, match="not found"):
+            await link_kyo_nodes("nonexistent", "also-nonexistent", "references")
+
+    @pytest.mark.asyncio
+    async def test_link_node_created_elsewhere(self):
+        """Regression: link validation used a per-process in-memory graph,
+        so nodes created by the CLI or another server process couldn't be
+        linked until a restart."""
+        from kyo_mcp.database import create_concept
+
+        create_concept({"id": "from-cli", "type": "concept", "title": "CLI Node"})
+        a = await make_node("Server Node")
+        assert "Linked" in await link_kyo_nodes(a, "from-cli", "references")
+
+    @pytest.mark.asyncio
+    async def test_get_links_and_unlink(self):
+        a = await make_node("A")
+        b = await make_node("B")
+        await link_kyo_nodes(a, b, "references")
+        assert f"-> [references] {b} (B)" in await get_node_links(a, direction="out")
+        assert f"<- [references] {a} (A)" in await get_node_links(b, direction="in")
+        await unlink_kyo_nodes(a, b)
+        assert "no out links" in await get_node_links(a, direction="out")
+
+    @pytest.mark.asyncio
+    async def test_unlink_missing(self):
+        with pytest.raises(ToolError):
+            await unlink_kyo_nodes("x", "y")
+
+    @pytest.mark.asyncio
+    async def test_find_path(self):
+        a = await make_node("A")
+        b = await make_node("B")
+        c = await make_node("C")
+        await link_kyo_nodes(a, b, "references")
+        await link_kyo_nodes(b, c, "derives_from")
+        path = await find_path(a, c)
+        assert "-[references]->" in path and "-[derives_from]->" in path
+        assert "No path" in await find_path(c, a)
+        assert "No path" not in await find_path(c, a, directed=False)
 
 
 class TestVerifyKyoNode:
     @pytest.mark.asyncio
     async def test_verify_node(self):
-        result = await create_kyo_node(title="Verify Me", description="Test")
-        node_id = result.split(": ")[1].split(" (")[0]
+        node_id = await make_node("Verify Me")
         verify_result = await verify_kyo_node(node_id, "alice")
         assert "Human-Reviewed" in verify_result
         assert "human:alice" in verify_result
 
     @pytest.mark.asyncio
+    async def test_verify_prefixed_actor(self):
+        """Regression: an already-prefixed actor was stored as human:human:x."""
+        node_id = await make_node("Prefixed")
+        await verify_kyo_node(node_id, "human:bob")
+        assert get_concept_by_id(node_id)["verified"][0]["by"] == "human:bob"
+
+    @pytest.mark.asyncio
     async def test_verify_nonexistent(self):
-        result = await verify_kyo_node("nonexistent", "alice")
-        assert "not found" in result.lower()
+        with pytest.raises(ToolError, match="not found"):
+            await verify_kyo_node("nonexistent", "alice")
 
 
 class TestGetNodeTrustStatus:
     @pytest.mark.asyncio
     async def test_unverified_status(self):
-        result = await create_kyo_node(title="Fresh Node", description="Test")
-        node_id = result.split("(")[1].rstrip(")")
+        node_id = await make_node("Fresh Node")
         status = await get_node_trust_status(node_id)
         assert "Unverified" in status
+        assert "Freshness: Fresh" in status
 
     @pytest.mark.asyncio
     async def test_verified_status(self):
-        result = await create_kyo_node(title="Verified Node", description="Test")
-        node_id = result.split(": ")[1].split(" (")[0]
+        node_id = await make_node("Verified Node")
         await verify_kyo_node(node_id, "bob")
-        status = await get_node_trust_status(node_id)
-        assert "Human-Reviewed" in status
+        assert "Human-Reviewed" in await get_node_trust_status(node_id)
+
+    @pytest.mark.asyncio
+    async def test_stale_status(self):
+        node_id = await make_node("Old News", stale_after="2000-01-01")
+        assert "Freshness: Stale" in await get_node_trust_status(node_id)
 
     @pytest.mark.asyncio
     async def test_nonexistent_node(self):
-        result = await get_node_trust_status("nonexistent")
-        assert "not found" in result.lower()
+        with pytest.raises(ToolError, match="not found"):
+            await get_node_trust_status("nonexistent")
 
 
-class TestLoadGraphData:
-    @pytest.mark.asyncio
-    async def test_load_empty_graph(self):
-        # Clear graph and recreate database
-        G.clear()
-        import kyo_mcp.database as db_mod
-
-        # Disable foreign keys, drop tables, re-enable
-        conn = db_mod.get_connection()
-        conn.execute("PRAGMA foreign_keys = OFF")
-        conn.execute("DELETE FROM knowledge_links")
-        conn.execute("DELETE FROM knowledge_concepts")
-        conn.commit()
-        conn.execute("PRAGMA foreign_keys = ON")
-        load_graph_data()
-        assert len(G.nodes) == 0
+class TestIsStale:
+    def test_values(self):
+        assert is_stale(None) is False
+        assert is_stale("2000-01-01") is True
+        assert is_stale("2999-01-01T00:00:00Z") is False
+        assert is_stale("not a date") is False

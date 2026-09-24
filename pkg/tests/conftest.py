@@ -1,7 +1,5 @@
 """Shared test fixtures for Kyo MCP tests."""
 
-import os
-import shutil
 import sys
 from pathlib import Path
 
@@ -13,29 +11,16 @@ sys.path.insert(0, pkg_dir)
 
 
 @pytest.fixture(autouse=True)
-def setup_test_env(tmp_path):
-    """Each test gets a fresh tmpdir and a fresh database module."""
-    os.environ["KYO_DATA_DIR"] = str(tmp_path)
-
-    # Reload the database module so it picks up the new DB_PATH
-    import importlib
-
+def setup_test_env(tmp_path, monkeypatch):
+    """Each test gets a fresh database in its own tmpdir."""
     import kyo_mcp.database as db_mod
 
-    importlib.reload(db_mod)
-    db_mod.DB_PATH = str(tmp_path / "test_kyo_catalog.db")
-    db_mod.conn = None
-    db_mod.metadata = None
-    db_mod.get_connection()
-    yield
-
-    shutil.rmtree(tmp_path, ignore_errors=True)
-
-
-@pytest.fixture
-def db_path():
-    """Return a path string; tests should use the autouse fixture instead."""
-    return ""
+    db_mod.close_connections()
+    monkeypatch.setattr(db_mod, "DB_PATH", None)
+    monkeypatch.delenv("KYO_DATA_DIR", raising=False)
+    monkeypatch.setenv("KYO_DB_PATH", str(tmp_path / "test_kyo_catalog.db"))
+    yield tmp_path
+    db_mod.close_connections()
 
 
 @pytest.fixture

@@ -1,23 +1,52 @@
 import json
+import os
 import sqlite3
+import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
-import appdirs
+import platformdirs
 from kyo_mcp.okf_schema import OKFConcept
 
-DATA_DIR = Path(appdirs.user_data_dir("kyo", "kyo"))
-DB_PATH = DATA_DIR / "kyo_catalog.db"
-conn: Optional[sqlite3.Connection] = None
+# Explicit override for the default database location. Tests and embedders
+# may set this directly; otherwise the path comes from the environment (see
+# default_db_path()).
+DB_PATH: Optional[Path] = None
+
+# One connection per database file, shared across calls. check_same_thread
+# is off because the MCP server may call in from worker threads (see
+# bridge.py's asyncio.to_thread use), so writes are serialized by _lock.
+_connections: Dict[str, sqlite3.Connection] = {}
+_lock = threading.RLock()
 
 
-def _ensure_data_dir_exists(db_path: Path) -> None:
-    """Ensures the parent directories for the DB file exist."""
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+def default_db_path() -> Path:
+    """Resolve the default database path, checked in this order:
+    DB_PATH (module override), $KYO_DB_PATH, $KYO_DATA_DIR/kyo_catalog.db,
+    then the platform user data directory."""
+    if DB_PATH is not None:
+        return Path(DB_PATH)
+    if os.environ.get("KYO_DB_PATH"):
+        return Path(os.environ["KYO_DB_PATH"])
+    data_dir = os.environ.get("KYO_DATA_DIR") or platformdirs.user_data_dir(
+        "kyo", "kyo"
+    )
+    return Path(data_dir) / "kyo_catalog.db"
 
 
-def _initialize_schema(connection: sqlite3.Connection) -> None:
-    cursor = connection.cursor()
+def _add_columns(cursor: sqlite3.Cursor, columns: List[str]) -> None:
+    # SQLite has no ADD COLUMN IF NOT EXISTS, and databases created before
+    # PRAGMA user_version tracking may already have some of these columns.
+    existing = {
+        row[1] for row in cursor.execute("PRAGMA table_info(knowledge_concepts)")
+    }
+    for column in columns:
+        if column not in existing:
+            cursor.execute(f"ALTER TABLE knowledge_concepts ADD COLUMN {column} TEXT")
+
+
+def _migrate_v1(cursor: sqlite3.Cursor) -> None:
+    """Base schema: concepts, links, and their indexes."""
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS knowledge_concepts (
             id TEXT PRIMARY KEY,
@@ -32,37 +61,6 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Lightweight migration, no formal migration framework in this project:
-    # CREATE TABLE IF NOT EXISTS above is a no-op on an existing table, so a
-    # new column needs its own ALTER TABLE, guarded against re-running on a
-    # database that already has it (SQLite has no ADD COLUMN IF NOT EXISTS).
-    # These track the content hash last successfully synced to each memory
-    # system, so bridge.py can skip a resync when nothing has changed
-    # (2026-09-09: sync_to_hindsight/sync_to_mnemosyne had no such check and
-    # resynced every node on every call, and Hindsight's own dedup only
-    # merges near-identical text, so repeated non-deterministic LLM
-    # extractions of the same unchanged concept kept landing as fresh,
-    # mostly-unmerged noise instead of being recognized as repeat syncs).
-    existing_columns = {
-        row[1] for row in cursor.execute("PRAGMA table_info(knowledge_concepts)")
-    }
-    for column in ("hindsight_synced_hash", "mnemosyne_synced_hash"):
-        if column not in existing_columns:
-            cursor.execute(f"ALTER TABLE knowledge_concepts ADD COLUMN {column} TEXT")
-    # Track a Hindsight retain submitted with async=true (2026-09-15: every
-    # prior sync_to_hindsight call blocked on Hindsight's full fact-extraction
-    # pipeline synchronously, which stalls for as long as the underlying LLM
-    # call takes: confirmed to reach 45+ minutes once, well past bridge.py's
-    # own 180s requests timeout, so every such call reliably "failed" client-
-    # side regardless of whether Hindsight would have eventually succeeded.
-    # Hindsight's own /memories endpoint already supports async=true +
-    # operation_id; hindsight_operation_id/hindsight_pending_hash record what
-    # was submitted so a later check_hindsight_operation call can poll
-    # GET .../operations/{operation_id} and only promote hindsight_pending_hash
-    # to hindsight_synced_hash once Hindsight actually reports "completed".
-    for column in ("hindsight_operation_id", "hindsight_pending_hash"):
-        if column not in existing_columns:
-            cursor.execute(f"ALTER TABLE knowledge_concepts ADD COLUMN {column} TEXT")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_type ON knowledge_concepts(type)")
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_status ON knowledge_concepts(status)"
@@ -87,11 +85,77 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_link_target ON knowledge_links(target_id)"
     )
+
+
+def _migrate_v2(cursor: sqlite3.Cursor) -> None:
+    """Content hash last successfully synced to each memory system, so
+    bridge.py can skip a resync when nothing has changed. Without it, every
+    sync re-ran Hindsight's non-deterministic LLM extraction on unchanged
+    concepts, and its text-similarity dedup let near-duplicate facts pile up."""
+    _add_columns(cursor, ["hindsight_synced_hash", "mnemosyne_synced_hash"])
+
+
+def _migrate_v3(cursor: sqlite3.Cursor) -> None:
+    """Track an in-flight Hindsight retain submitted with async=true.
+    Synchronous retains block on Hindsight's full LLM extraction pipeline
+    (observed at 45+ minutes on a CPU-only backend), so sync_to_hindsight
+    submits asynchronously and check_hindsight_operation later promotes
+    hindsight_pending_hash to hindsight_synced_hash once Hindsight reports
+    the operation "completed"."""
+    _add_columns(cursor, ["hindsight_operation_id", "hindsight_pending_hash"])
+
+
+def _migrate_v4(cursor: sqlite3.Cursor) -> None:
+    """Full-text search over title, description, tags, and body, kept in
+    step with knowledge_concepts by triggers."""
+    cursor.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
+            title, description, tags, body_text,
+            content='knowledge_concepts', content_rowid='rowid',
+            tokenize='porter unicode61'
+        )
+    """)
+    cursor.executescript("""
+        CREATE TRIGGER IF NOT EXISTS knowledge_fts_ai AFTER INSERT ON knowledge_concepts BEGIN
+            INSERT INTO knowledge_fts(rowid, title, description, tags, body_text)
+            VALUES (new.rowid, new.title, new.description, new.tags, new.body_text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS knowledge_fts_ad AFTER DELETE ON knowledge_concepts BEGIN
+            INSERT INTO knowledge_fts(knowledge_fts, rowid, title, description, tags, body_text)
+            VALUES ('delete', old.rowid, old.title, old.description, old.tags, old.body_text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS knowledge_fts_au AFTER UPDATE ON knowledge_concepts BEGIN
+            INSERT INTO knowledge_fts(knowledge_fts, rowid, title, description, tags, body_text)
+            VALUES ('delete', old.rowid, old.title, old.description, old.tags, old.body_text);
+            INSERT INTO knowledge_fts(rowid, title, description, tags, body_text)
+            VALUES (new.rowid, new.title, new.description, new.tags, new.body_text);
+        END;
+    """)
+    # Index rows that existed before this migration.
+    cursor.execute("INSERT INTO knowledge_fts(knowledge_fts) VALUES ('rebuild')")
+
+
+# Append-only: each entry upgrades the schema from version i to i + 1, and
+# PRAGMA user_version records how many have been applied.
+MIGRATIONS: List[Callable[[sqlite3.Cursor], None]] = [
+    _migrate_v1,
+    _migrate_v2,
+    _migrate_v3,
+    _migrate_v4,
+]
+
+
+def _initialize_schema(connection: sqlite3.Connection) -> None:
+    cursor = connection.cursor()
+    version = cursor.execute("PRAGMA user_version").fetchone()[0]
+    for target, migration in enumerate(MIGRATIONS[version:], start=version + 1):
+        migration(cursor)
+        cursor.execute(f"PRAGMA user_version = {target}")
     connection.commit()
 
 
 def _open_connection(db_path: Path) -> sqlite3.Connection:
-    _ensure_data_dir_exists(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(str(db_path), check_same_thread=False, timeout=30.0)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA journal_mode=WAL")
@@ -101,19 +165,58 @@ def _open_connection(db_path: Path) -> sqlite3.Connection:
 
 
 def get_connection(db_path: Optional[Path] = None) -> sqlite3.Connection:
-    """Return an initialized connection for the default or requested database."""
-    global conn
-    if db_path is not None:
-        return _open_connection(Path(db_path))
-    if conn is None:
-        conn = _open_connection(Path(DB_PATH))
-    return conn
+    """Return the shared, initialized connection for the default or
+    requested database, opening it on first use."""
+    path = Path(db_path) if db_path is not None else default_db_path()
+    key = str(path.resolve())
+    with _lock:
+        if key not in _connections:
+            _connections[key] = _open_connection(path)
+        return _connections[key]
+
+
+def close_connections() -> None:
+    """Close every cached connection (used between tests and at shutdown)."""
+    with _lock:
+        for connection in _connections.values():
+            connection.close()
+        _connections.clear()
 
 
 def initialize_db(db_path: Path) -> None:
     """Create the catalogue schema at an explicit database path."""
-    connection = get_connection(db_path)
-    connection.close()
+    get_connection(db_path)
+
+
+class ConceptExistsError(ValueError):
+    """Raised by create_concept(update_existing=False) on an id collision."""
+
+
+def _concept_row(
+    validated: OKFConcept, verified: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    data = validated.model_dump(mode="json")
+    resource = data.get("resource") or {}
+    metadata_obj = {
+        **(data.get("metadata") or {}),
+        "generated": data.get("generated"),
+        "verified": verified,
+        "sources": data.get("sources") or [],
+        "stale_after": data.get("stale_after"),
+    }
+    return {
+        "id": data["id"],
+        "type": data["type"],
+        "title": data.get("title"),
+        "description": data.get("description"),
+        "resource": resource.get("uri") or resource.get("url"),
+        "status": data.get("status", "stable"),
+        "tags": json.dumps(data.get("tags") or []),
+        # Drop None values to keep the stored JSON clean.
+        "metadata": json.dumps(
+            {k: v for k, v in metadata_obj.items() if v is not None}
+        ),
+    }
 
 
 def create_concept(
@@ -122,64 +225,96 @@ def create_concept(
     update_existing: bool = True,
     db_path: Optional[Path] = None,
 ) -> None:
-    """Validate and persist a concept to the catalogue."""
-    validated_concept = OKFConcept.model_validate(concept_dict)
+    """Validate and persist a concept to the catalogue.
+
+    With update_existing=False, an existing id raises ConceptExistsError
+    instead of being overwritten. With update_existing=True, an existing
+    concept is replaced, but its verification history is kept: new
+    `verified` entries are appended to the stored ones, not substituted.
+    """
+    validated = OKFConcept.model_validate(concept_dict)
+    if not validated.id:
+        raise ValueError("Concept id is required")
+    new_verified = [v.model_dump() for v in validated.verified or []]
     connection = get_connection(db_path)
 
-    data = validated_concept.model_dump(mode="json")
-    tags_json = json.dumps(data.get("tags") or [])
+    with _lock, connection:
+        existing = connection.execute(
+            "SELECT metadata FROM knowledge_concepts WHERE id = ?", (validated.id,)
+        ).fetchone()
+        if existing and not update_existing:
+            raise ConceptExistsError(f"Concept {validated.id} already exists")
 
-    # Handle resource: ensure we store a plain string/URL
-    res_source = data.get("resource")
-    if isinstance(res_source, dict):
-        resource_str = res_source.get("uri") or res_source.get("url")
-    else:
-        resource_str = str(res_source) if res_source else None
-
-    # Extract complex OKF fields for metadata JSON storage
-    generated_entry = data.pop("generated", None)
-    verified_list = data.pop("verified", [])
-    sources_list = data.pop("sources", [])
-    stale_after_str = data.pop("stale_after", None)
-
-    # Construct enriched metadata object per OKF v0.2 §5 (Provenance/Trust/Lifecycle)
-    metadata_obj = {
-        "generated": generated_entry,
-        "verified": verified_list,
-        "sources": sources_list,
-        "stale_after": stale_after_str,
-    }
-
-    # Filter out None values to keep JSON clean
-    metadata_json = json.dumps({k: v for k, v in metadata_obj.items() if v is not None})
-
-    query = """
-        INSERT INTO knowledge_concepts
-        (id, type, title, description, resource, status, tags, metadata, body_text, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    """
-
-    if update_existing:
-        query += (
-            " ON CONFLICT(id) DO UPDATE SET\n"
-            "title = EXCLUDED.title,\n resource = EXCLUDED.resource,\n type = EXCLUDED.type,\n status = EXCLUDED.status,\n tags = EXCLUDED.tags,\n metadata = EXCLUDED.metadata,\n body_text = EXCLUDED.body_text,\n description = EXCLUDED.description\n"
+        verified = (
+            _load_json(existing["metadata"]).get("verified", []) if existing else []
         )
+        verified += [v for v in new_verified if v not in verified]
+        row = _concept_row(validated, verified)
+        row["body_text"] = markdown_body
 
-    connection.execute(
-        query,
-        (
-            data.get("id"),
-            data["type"],
-            data.get("title"),
-            data.get("description"),
-            resource_str,
-            data.get("status", "stable"),
-            tags_json,
-            metadata_json,
-            markdown_body,
-        ),
-    )
-    connection.commit()
+        if existing:
+            connection.execute(
+                """
+                UPDATE knowledge_concepts SET
+                    type = :type, title = :title, description = :description,
+                    resource = :resource, status = :status, tags = :tags,
+                    metadata = :metadata, body_text = :body_text,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = :id
+                """,
+                row,
+            )
+        else:
+            connection.execute(
+                """
+                INSERT INTO knowledge_concepts
+                (id, type, title, description, resource, status, tags, metadata, body_text)
+                VALUES (:id, :type, :title, :description, :resource, :status, :tags,
+                        :metadata, :body_text)
+                """,
+                row,
+            )
+
+
+def update_concept(
+    concept_id: str,
+    changes: Dict[str, Any],
+    markdown_body: Optional[str] = None,
+    db_path: Optional[Path] = None,
+) -> Optional[Dict[str, Any]]:
+    """Apply a partial update to a stored concept, re-validating the result.
+    Returns the updated concept, or None if it doesn't exist."""
+    with _lock:
+        current = get_concept_by_id(concept_id, db_path=db_path)
+        if current is None:
+            return None
+        if markdown_body is None:
+            markdown_body = current.get("body_text") or ""
+        merged = {**current, **changes, "id": concept_id}
+        create_concept(merged, markdown_body, update_existing=True, db_path=db_path)
+        return get_concept_by_id(concept_id, db_path=db_path)
+
+
+def delete_concept(concept_id: str, db_path: Optional[Path] = None) -> bool:
+    """Delete a concept and every link touching it. Returns False if it
+    didn't exist."""
+    connection = get_connection(db_path)
+    with _lock, connection:
+        connection.execute(
+            "DELETE FROM knowledge_links WHERE source_id = ? OR target_id = ?",
+            (concept_id, concept_id),
+        )
+        cursor = connection.execute(
+            "DELETE FROM knowledge_concepts WHERE id = ?", (concept_id,)
+        )
+    return cursor.rowcount > 0
+
+
+def _load_json(raw: Optional[str]) -> Dict[str, Any]:
+    try:
+        return json.loads(raw or "{}") or {}
+    except (json.JSONDecodeError, TypeError):
+        return {}
 
 
 def _deserialize_concept(row: sqlite3.Row) -> Dict[str, Any]:
@@ -189,37 +324,57 @@ def _deserialize_concept(row: sqlite3.Row) -> Dict[str, Any]:
     except (json.JSONDecodeError, TypeError):
         row_dict["tags"] = []
 
-    try:
-        metadata = json.loads(row_dict.get("metadata") or "{}")
-    except (json.JSONDecodeError, TypeError):
-        metadata = {}
-
-    row_dict["generated"] = metadata.get("generated")
-    row_dict["verified"] = metadata.get("verified", [])
-    row_dict["sources"] = metadata.get("sources", [])
-    row_dict["stale_after"] = metadata.get("stale_after")
-    # OKFConcept.metadata is a genuine Dict[str, Any] field, separate from
-    # generated/verified/sources/stale_after above. It must not be left as
-    # the raw SQLite TEXT column, or OKFConcept.model_validate() fails with
-    # "Input should be a valid dictionary" on every row.
+    metadata = _load_json(row_dict.get("metadata"))
+    row_dict["generated"] = metadata.pop("generated", None)
+    row_dict["verified"] = metadata.pop("verified", [])
+    row_dict["sources"] = metadata.pop("sources", [])
+    row_dict["stale_after"] = metadata.pop("stale_after", None)
+    # What remains is OKFConcept.metadata: arbitrary extra keys, stored
+    # alongside the trust fields above in the same JSON column.
     row_dict["metadata"] = metadata
+    row_dict["resource"] = (
+        {"uri": row_dict["resource"]} if row_dict.get("resource") else None
+    )
     return row_dict
+
+
+def _fts_query(search_term: str) -> str:
+    """Turn free text into an FTS5 query: every word must match, each as a
+    quoted prefix term, so user input can't produce FTS5 syntax errors."""
+    terms = [t.replace('"', '""') for t in search_term.split()]
+    return " ".join(f'"{t}"*' for t in terms if t)
 
 
 def query_catalog(
     type_filter: Optional[str] = None,
     search_term: Optional[str] = None,
     db_path: Optional[Path] = None,
+    limit: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
+    """List concepts, optionally filtered by type and a full-text search
+    over title, description, tags, and body. Search results are ranked by
+    relevance; unfiltered listings are newest first."""
     connection = get_connection(db_path)
-    sql = "SELECT * FROM knowledge_concepts WHERE 1=1"
-    params = []
+    params: List[Any] = []
+    fts = _fts_query(search_term) if search_term else ""
+    if fts:
+        sql = (
+            "SELECT c.* FROM knowledge_fts f "
+            "JOIN knowledge_concepts c ON c.rowid = f.rowid "
+            "WHERE knowledge_fts MATCH ?"
+        )
+        params.append(fts)
+    else:
+        sql = "SELECT c.* FROM knowledge_concepts c WHERE 1=1"
     if type_filter:
-        sql += " AND type = ?"
+        sql += " AND c.type = ?"
         params.append(type_filter)
-    if search_term:
-        sql += " AND title LIKE ?"
-        params.append(f"%{search_term}%")
+    sql += (
+        " ORDER BY bm25(knowledge_fts)" if fts else " ORDER BY c.updated_at DESC, c.id"
+    )
+    if limit:
+        sql += " LIMIT ?"
+        params.append(limit)
 
     rows = connection.execute(sql, params).fetchall()
     return [_deserialize_concept(row) for row in rows]
@@ -241,35 +396,29 @@ def get_concept_by_id(
 def update_node_verified(
     node_id: str, new_verified_actor: dict, db_path: Optional[Path] = None
 ) -> bool:
+    """Record a human verification event. `by` may be given bare ("alice")
+    or already prefixed ("human:alice"); either is stored as "human:alice"."""
     conn = get_connection(db_path)
-    row = conn.execute(
-        "SELECT metadata FROM knowledge_concepts WHERE id = ?", (node_id,)
-    ).fetchone()
-    if not row:
-        return False
+    with _lock, conn:
+        row = conn.execute(
+            "SELECT metadata FROM knowledge_concepts WHERE id = ?", (node_id,)
+        ).fetchone()
+        if not row:
+            return False
 
-    try:
-        meta = json.loads(row[0]) or {}
-    except json.JSONDecodeError:
-        meta = {}
+        meta = _load_json(row[0])
+        verified_list = meta.get("verified", [])
 
-    verified_list = meta.get("verified", [])
+        actor = new_verified_actor.get("by", "").removeprefix("human:")
+        new_entry = {**new_verified_actor, "by": f"human:{actor}"}
+        if new_entry not in verified_list:
+            verified_list.append(new_entry)
+        meta["verified"] = verified_list
 
-    # Avoid duplicates
-    new_entry = {
-        **new_verified_actor,
-        "by": f"human:{new_verified_actor.get('by', '')}",
-    }
-    if new_entry not in verified_list:
-        verified_list.append(new_entry)
-
-    meta["verified"] = verified_list
-
-    conn.execute(
-        "UPDATE knowledge_concepts SET metadata = ? WHERE id = ?",
-        (json.dumps(meta), node_id),
-    )
-    conn.commit()
+        conn.execute(
+            "UPDATE knowledge_concepts SET metadata = ? WHERE id = ?",
+            (json.dumps(meta), node_id),
+        )
     return True
 
 
@@ -303,11 +452,11 @@ def set_sync_hash(
     # column is whitelisted in _SYNC_HASH_COLUMNS, cannot be user-controlled
     column = _SYNC_HASH_COLUMNS[system]
     conn = get_connection(db_path)
-    conn.execute(
-        f"UPDATE knowledge_concepts SET {column} = ? WHERE id = ?",  # nosec B608
-        (content_hash, node_id),
-    )
-    conn.commit()
+    with _lock, conn:
+        conn.execute(
+            f"UPDATE knowledge_concepts SET {column} = ? WHERE id = ?",  # nosec B608
+            (content_hash, node_id),
+        )
 
 
 def get_hindsight_operation(
@@ -326,6 +475,15 @@ def get_hindsight_operation(
     return (row[0], row[1])
 
 
+def list_pending_hindsight_operations(db_path: Optional[Path] = None) -> List[str]:
+    """Return the ids of every node with an in-flight Hindsight retain."""
+    conn = get_connection(db_path)
+    rows = conn.execute(
+        "SELECT id FROM knowledge_concepts WHERE hindsight_operation_id IS NOT NULL"
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
 def set_hindsight_operation(
     node_id: str,
     operation_id: str,
@@ -337,13 +495,13 @@ def set_hindsight_operation(
     what to poll for and what to promote to hindsight_synced_hash on
     completion."""
     conn = get_connection(db_path)
-    conn.execute(
-        "UPDATE knowledge_concepts "
-        "SET hindsight_operation_id = ?, hindsight_pending_hash = ? "
-        "WHERE id = ?",
-        (operation_id, pending_hash, node_id),
-    )
-    conn.commit()
+    with _lock, conn:
+        conn.execute(
+            "UPDATE knowledge_concepts "
+            "SET hindsight_operation_id = ?, hindsight_pending_hash = ? "
+            "WHERE id = ?",
+            (operation_id, pending_hash, node_id),
+        )
 
 
 def clear_hindsight_operation(node_id: str, db_path: Optional[Path] = None) -> None:
@@ -352,27 +510,69 @@ def clear_hindsight_operation(node_id: str, db_path: Optional[Path] = None) -> N
     set would make every later sync_to_hindsight call think one is still
     pending and refuse to submit a fresh one."""
     conn = get_connection(db_path)
-    conn.execute(
-        "UPDATE knowledge_concepts "
-        "SET hindsight_operation_id = NULL, hindsight_pending_hash = NULL "
-        "WHERE id = ?",
-        (node_id,),
-    )
-    conn.commit()
+    with _lock, conn:
+        conn.execute(
+            "UPDATE knowledge_concepts "
+            "SET hindsight_operation_id = NULL, hindsight_pending_hash = NULL "
+            "WHERE id = ?",
+            (node_id,),
+        )
 
 
 def create_link(
     source_id: str, target_id: str, relation_type: str, db_path: Optional[Path] = None
 ) -> None:
     conn = get_connection(db_path)
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO knowledge_links (source_id, target_id, relation_type)
-        VALUES (?, ?, ?)
-        """,
-        (source_id, target_id, relation_type),
-    )
-    conn.commit()
+    with _lock, conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO knowledge_links (source_id, target_id, relation_type)
+            VALUES (?, ?, ?)
+            """,
+            (source_id, target_id, relation_type),
+        )
+
+
+def delete_link(
+    source_id: str,
+    target_id: str,
+    relation_type: Optional[str] = None,
+    db_path: Optional[Path] = None,
+) -> int:
+    """Delete links from source to target (only of `relation_type` if
+    given). Returns how many were removed."""
+    conn = get_connection(db_path)
+    sql = "DELETE FROM knowledge_links WHERE source_id = ? AND target_id = ?"
+    params: List[Any] = [source_id, target_id]
+    if relation_type:
+        sql += " AND relation_type = ?"
+        params.append(relation_type)
+    with _lock, conn:
+        return conn.execute(sql, params).rowcount
+
+
+def get_links(
+    node_id: str, direction: str = "both", db_path: Optional[Path] = None
+) -> List[Dict[str, Any]]:
+    """Links touching a node: "out" (node is the source), "in" (node is the
+    target), or "both"."""
+    if direction not in ("in", "out", "both"):
+        raise ValueError("direction must be 'in', 'out', or 'both'")
+    conn = get_connection(db_path)
+    clauses = []
+    params: List[Any] = []
+    if direction in ("out", "both"):
+        clauses.append("source_id = ?")
+        params.append(node_id)
+    if direction in ("in", "both"):
+        clauses.append("target_id = ?")
+        params.append(node_id)
+    rows = conn.execute(
+        "SELECT source_id, target_id, relation_type FROM knowledge_links "
+        f"WHERE {' OR '.join(clauses)} ORDER BY created_at",  # nosec B608
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def get_all_links(db_path: Optional[Path] = None) -> List[Dict[str, Any]]:

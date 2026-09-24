@@ -298,7 +298,7 @@ class TestDatabase:
         }
         create_concept(concept, "Test body")
         result = get_concept_by_id("meta-test")
-        assert result["resource"] == "https://example.com"
+        assert result["resource"] == {"uri": "https://example.com"}
 
     def test_resource_string_handling(self):
         """Test that resource dict gets stored as string."""
@@ -315,7 +315,7 @@ class TestDatabase:
         }
         create_concept(concept, "Test body")
         result = get_concept_by_id("res-test")
-        assert result["resource"] == "https://example.com"
+        assert result["resource"] == {"uri": "https://example.com"}
 
     def test_get_all_links_empty(self):
         """get_all_links returns empty list when no links exist."""
@@ -367,3 +367,98 @@ class TestDatabase:
         assert len(links) == 2
         assert links[0]["relation_type"] == "references"
         assert links[1]["relation_type"] == "derives_from"
+
+
+class TestRegressions:
+    """Bugs confirmed against the pre-0.2 code."""
+
+    def test_stale_after_and_extra_metadata_round_trip(self):
+        create_concept(
+            {
+                "id": "fresh",
+                "type": "concept",
+                "stale_after": "2030-01-01",
+                "metadata": {"owner": "team-a"},
+            }
+        )
+        result = get_concept_by_id("fresh")
+        assert result["stale_after"] == "2030-01-01"
+        assert result["metadata"] == {"owner": "team-a"}
+
+    def test_upsert_keeps_verification_history(self):
+        create_concept({"id": "kept", "type": "concept", "title": "v1"})
+        update_node_verified("kept", {"by": "alice", "at": "2024-01-01T00:00:00Z"})
+        create_concept({"id": "kept", "type": "concept", "title": "v2"})
+        result = get_concept_by_id("kept")
+        assert result["title"] == "v2"
+        assert [v["by"] for v in result["verified"]] == ["human:alice"]
+
+    def test_upsert_refreshes_updated_at(self):
+        from kyo_mcp.database import get_connection
+
+        create_concept({"id": "ts", "type": "concept", "title": "v1"})
+        conn = get_connection()
+        conn.execute(
+            "UPDATE knowledge_concepts SET updated_at = '2000-01-01' WHERE id = 'ts'"
+        )
+        conn.commit()
+        create_concept({"id": "ts", "type": "concept", "title": "v2"})
+        assert get_concept_by_id("ts")["updated_at"] != "2000-01-01"
+
+    def test_insert_only_refuses_overwrite(self):
+        import pytest
+        from kyo_mcp.database import ConceptExistsError
+
+        create_concept({"id": "once", "type": "concept", "title": "first"})
+        with pytest.raises(ConceptExistsError):
+            create_concept(
+                {"id": "once", "type": "concept", "title": "second"},
+                update_existing=False,
+            )
+        assert get_concept_by_id("once")["title"] == "first"
+
+    def test_verified_prefix_not_doubled(self):
+        create_concept({"id": "pfx", "type": "concept"})
+        update_node_verified("pfx", {"by": "human:bob"})
+        assert get_concept_by_id("pfx")["verified"][0]["by"] == "human:bob"
+
+    def test_stored_concept_with_resource_validates(self):
+        """A stored resource came back as a bare string, which OKFConcept
+        rejects, so no node with a resource could be synced or exported."""
+        from kyo_mcp.okf_schema import OKFConcept
+
+        create_concept(
+            {"id": "res", "type": "concept", "resource": {"uri": "https://x.test"}}
+        )
+        concept = OKFConcept.model_validate(get_concept_by_id("res"))
+        assert concept.resource == {"uri": "https://x.test"}
+
+
+class TestMigrations:
+    def test_upgrades_pre_versioned_database(self, tmp_path):
+        """A database created before PRAGMA user_version tracking (the
+        original schema, with some rows) upgrades in place and its
+        existing rows become searchable."""
+        import sqlite3
+
+        from kyo_mcp.database import MIGRATIONS, get_connection
+
+        path = tmp_path / "old.db"
+        old = sqlite3.connect(path)
+        old.execute(
+            "CREATE TABLE knowledge_concepts (id TEXT PRIMARY KEY, type TEXT NOT NULL, "
+            "title TEXT, description TEXT, resource TEXT, status TEXT DEFAULT 'stable', "
+            "tags TEXT, metadata TEXT, body_text TEXT, "
+            "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, hindsight_synced_hash TEXT)"
+        )
+        old.execute(
+            "INSERT INTO knowledge_concepts (id, type, title, tags, metadata) "
+            "VALUES ('legacy', 'concept', 'Legacy Zebra', '[]', '{}')"
+        )
+        old.commit()
+        old.close()
+
+        conn = get_connection(path)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == len(MIGRATIONS)
+        results = query_catalog(search_term="zebra", db_path=path)
+        assert [r["id"] for r in results] == ["legacy"]
