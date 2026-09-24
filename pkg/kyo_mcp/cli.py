@@ -16,6 +16,7 @@ Commands:
     recall_from_hindsight <query> [--limit N]
     sync_all
     trigger_consolidation
+    trigger_reflection [query] [--concept-id ID]
 
 Every command prints JSON to stdout; failures print a JSON error to stderr
 and exit with status 1.
@@ -140,6 +141,22 @@ async def cmd_trigger_consolidation(args: argparse.Namespace) -> Any:
     return {"success": success, "error": bridge.last_error}
 
 
+async def cmd_trigger_reflection(args: argparse.Namespace) -> Any:
+    """Ask Hindsight to reflect on a free-text query, or on a concept (its
+    title and description become the query)."""
+    query = " ".join(args.query)
+    if args.concept_id:
+        concept = _load_concept(args.concept_id)
+        query = f"{concept.title}: {concept.description or ''}".strip()
+    if not query:
+        raise CommandError("Pass a query or --concept-id")
+    bridge = BridgeLayer()
+    result = await bridge.trigger_reflection(query)
+    if bridge.last_error:
+        raise CommandError(bridge.last_error)
+    return {"query": query, "result": result}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Kyo CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -188,6 +205,13 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("trigger_consolidation").set_defaults(
         func=cmd_trigger_consolidation
     )
+
+    p = subparsers.add_parser("trigger_reflection")
+    p.add_argument(
+        "query", nargs="*", help="Reflection query (words joined with spaces)"
+    )
+    p.add_argument("--concept-id", default=None, help="Reflect on this concept instead")
+    p.set_defaults(func=cmd_trigger_reflection)
     return parser
 
 
