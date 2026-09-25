@@ -346,11 +346,40 @@ def _deserialize_concept(row: sqlite3.Row) -> Dict[str, Any]:
     return row_dict
 
 
-def _fts_query(search_term: str) -> str:
-    """Turn free text into an FTS5 query: every word must match, each as a
-    quoted prefix term, so user input can't produce FTS5 syntax errors."""
-    terms = [t.replace('"', '""') for t in search_term.split()]
-    return " ".join(f'"{t}"*' for t in terms if t)
+# Dropped from a search query before building the FTS5 MATCH expression.
+# search_knowledge's docstring used to say "every word must match", which
+# is precise for a deliberate keyword query but returns nothing for a
+# conversational one ("what concepts are synced" has no node containing
+# all four of those literal words). Stripping stopwords first means the
+# strict AND match only has to cover the words that actually carry
+# meaning; _fts_terms below still falls back further, to an OR match,
+# when even that comes up empty.
+_STOPWORDS = frozenset(
+    """
+    a an the is are was were be been being do does did what which who
+    whom this that these those of in on at to for and or but with about
+    from as it its we you i me my our us
+    """.split()
+)
+
+
+def _fts_terms(search_term: str) -> List[str]:
+    """Split free text into search terms, dropping stopwords -- unless
+    that would leave nothing to search for, in which case the original
+    words are kept so the query still runs (and legitimately finds
+    nothing) rather than silently searching for an empty string."""
+    words = search_term.split()
+    filtered = [w for w in words if w.lower() not in _STOPWORDS]
+    return filtered or words
+
+
+def _fts_match(terms: List[str], match_all: bool) -> str:
+    """Build an FTS5 MATCH expression from `terms`, each a quoted prefix
+    term so user input can't produce FTS5 query syntax. AND (match_all)
+    requires every term to hit; OR requires only one, still bm25-ranked
+    so rows matching more terms naturally score above rows matching one."""
+    quoted = [f'"{t.replace(chr(34), chr(34) * 2)}"*' for t in terms if t]
+    return (" AND " if match_all else " OR ").join(quoted)
 
 
 def query_catalog(
@@ -359,32 +388,43 @@ def query_catalog(
     db_path: Optional[Path] = None,
     limit: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """List concepts, optionally filtered by type and a full-text search
-    over title, description, tags, and body. Search results are ranked by
-    relevance; unfiltered listings are newest first."""
+    """List concepts, optionally filtered by type and a search over title,
+    description, tags, and body, ranked by relevance. A query matching
+    every term (as a prefix) is tried first; if that finds nothing and the
+    query has more than one word, it's retried requiring only one term to
+    match, so a natural-language query still surfaces the closest results
+    instead of coming back empty. An empty search_term lists concepts
+    newest first."""
     connection = get_connection(db_path)
-    params: List[Any] = []
-    fts = _fts_query(search_term) if search_term else ""
-    if fts:
-        sql = (
-            "SELECT c.* FROM knowledge_fts f "
-            "JOIN knowledge_concepts c ON c.rowid = f.rowid "
-            "WHERE knowledge_fts MATCH ?"
-        )
-        params.append(fts)
-    else:
-        sql = "SELECT c.* FROM knowledge_concepts c WHERE 1=1"
-    if type_filter:
-        sql += " AND c.type = ?"
-        params.append(type_filter)
-    sql += (
-        " ORDER BY bm25(knowledge_fts)" if fts else " ORDER BY c.updated_at DESC, c.id"
-    )
-    if limit:
-        sql += " LIMIT ?"
-        params.append(limit)
+    terms = _fts_terms(search_term) if search_term else []
 
-    rows = connection.execute(sql, params).fetchall()
+    def run(fts: str) -> List[sqlite3.Row]:
+        params: List[Any] = []
+        if fts:
+            sql = (
+                "SELECT c.* FROM knowledge_fts f "
+                "JOIN knowledge_concepts c ON c.rowid = f.rowid "
+                "WHERE knowledge_fts MATCH ?"
+            )
+            params.append(fts)
+        else:
+            sql = "SELECT c.* FROM knowledge_concepts c WHERE 1=1"
+        if type_filter:
+            sql += " AND c.type = ?"
+            params.append(type_filter)
+        sql += (
+            " ORDER BY bm25(knowledge_fts)"
+            if fts
+            else " ORDER BY c.updated_at DESC, c.id"
+        )
+        if limit:
+            sql += " LIMIT ?"
+            params.append(limit)
+        return connection.execute(sql, params).fetchall()
+
+    rows = run(_fts_match(terms, match_all=True)) if terms else run("")
+    if not rows and len(terms) > 1:
+        rows = run(_fts_match(terms, match_all=False))
     return [_deserialize_concept(row) for row in rows]
 
 

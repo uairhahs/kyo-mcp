@@ -259,8 +259,10 @@ async def search_knowledge(
     search_term: str = "", concept_type: str = "all", limit: int = 20
 ) -> str:
     """Full-text search across node titles, descriptions, tags, and bodies,
-    ranked by relevance. Every word must match (as a prefix). An empty
-    search_term lists the most recently updated nodes."""
+    ranked by relevance. Tries an exact match first (every word, as a
+    prefix); a multi-word query that matches nothing falls back to any
+    word matching, so a natural-language query still surfaces the closest
+    results. An empty search_term lists the most recently updated nodes."""
     results = query_catalog(
         type_filter=concept_type if concept_type != "all" else None,
         search_term=search_term,
