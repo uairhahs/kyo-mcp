@@ -94,6 +94,105 @@ def test_query_catalog_type_and_search():
     assert all("Search" in r["title"] for r in results)
 
 
+def test_query_catalog_and_match_takes_priority():
+    """A query where one node matches every term should return only that
+    node, not fall back to the OR match that would also pull in partial
+    matches."""
+    create_concept(
+        {
+            "id": "and-full",
+            "type": "concept",
+            "title": "Alpha widget calibration",
+            "description": "Covers both the widget and calibration together",
+            "resource": None,
+            "tags": [],
+            "status": "stable",
+            "verified": None,
+            "sources": [],
+        },
+        "Body",
+    )
+    create_concept(
+        {
+            "id": "and-partial",
+            "type": "concept",
+            "title": "Beta widget teardown",
+            "description": "Only mentions the widget, nothing else",
+            "resource": None,
+            "tags": [],
+            "status": "stable",
+            "verified": None,
+            "sources": [],
+        },
+        "Body",
+    )
+
+    results = query_catalog(search_term="widget calibration")
+    assert [r["id"] for r in results] == ["and-full"]
+
+
+def test_query_catalog_falls_back_to_or_when_and_finds_nothing():
+    """A natural-language query where no single node contains every word
+    should still surface the closest results instead of coming back
+    empty."""
+    create_concept(
+        {
+            "id": "or-1",
+            "type": "concept",
+            "title": "Widget teardown calibration steps",
+            "description": "About the widget and calibration",
+            "resource": None,
+            "tags": [],
+            "status": "stable",
+            "verified": None,
+            "sources": [],
+        },
+        "Body",
+    )
+    create_concept(
+        {
+            "id": "or-2",
+            "type": "concept",
+            "title": "Unrelated gadget assembly note",
+            "description": "Nothing to do with the query below",
+            "resource": None,
+            "tags": [],
+            "status": "stable",
+            "verified": None,
+            "sources": [],
+        },
+        "Body",
+    )
+
+    # No node contains all of "what", "concepts", "teardown",
+    # "calibration" -- stopwords ("what") are dropped, and the remaining
+    # AND match on "concepts teardown calibration" still finds nothing (no
+    # node has "concepts"), so this must fall back to an OR match.
+    results = query_catalog(search_term="what concepts teardown calibration")
+    assert [r["id"] for r in results] == ["or-1"]
+
+
+def test_query_catalog_single_word_search_unaffected():
+    """A single-word query has no AND/OR distinction and must behave
+    exactly as before."""
+    create_concept(
+        {
+            "id": "single-1",
+            "type": "concept",
+            "title": "Zebra migration notes",
+            "description": "Test",
+            "resource": None,
+            "tags": [],
+            "status": "stable",
+            "verified": None,
+            "sources": [],
+        },
+        "Body",
+    )
+    results = query_catalog(search_term="zebra")
+    assert [r["id"] for r in results] == ["single-1"]
+
+
 def test_update_node_verified_idempotent():
     """Multiple verify calls with same actor should not create duplicates."""
     concept = {
