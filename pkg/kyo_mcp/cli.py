@@ -14,6 +14,7 @@ Commands:
     sync_to_hindsight <concept_id>
     check_hindsight_operation <concept_id>
     recall_from_hindsight <query> [--limit N]
+    materialize_from_hindsight <query> [--limit N]
     sync_all
     trigger_consolidation
     trigger_reflection [query] [--concept-id ID]
@@ -136,6 +137,17 @@ async def cmd_recall_from_hindsight(args: argparse.Namespace) -> Any:
     return results
 
 
+async def cmd_materialize_from_hindsight(args: argparse.Namespace) -> Any:
+    """Pull memories back from Hindsight into the local catalogue."""
+    bridge = _bridge()
+    stats = await bridge.materialize_from_hindsight(
+        " ".join(args.query), top_k=args.limit or 10
+    )
+    if bridge.last_error:
+        raise CommandError(bridge.last_error)
+    return stats
+
+
 async def cmd_sync_all(args: argparse.Namespace) -> Any:
     """Sync all concepts."""
     return await _bridge().sync_all_concepts()
@@ -207,6 +219,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("query", nargs="*", help="Search query (words joined with spaces)")
     p.add_argument("--limit", type=int, default=10)
     p.set_defaults(func=cmd_recall_from_hindsight)
+
+    p = subparsers.add_parser("materialize_from_hindsight")
+    p.add_argument("query", nargs="*", help="Search query (words joined with spaces)")
+    p.add_argument("--limit", type=int, default=10)
+    p.set_defaults(func=cmd_materialize_from_hindsight)
 
     subparsers.add_parser("sync_all").set_defaults(func=cmd_sync_all)
     subparsers.add_parser("trigger_consolidation").set_defaults(

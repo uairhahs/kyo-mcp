@@ -395,6 +395,31 @@ async def recall_from_hindsight(query: str, top_k: int = 5) -> str:
 
 
 @mcp.tool()
+async def materialize_from_hindsight(query: str, top_k: int = 10) -> str:
+    """Pull memories back from Hindsight into kyo's local catalogue.
+
+    recall_from_hindsight alone only returns text for one turn; this
+    closes the loop so a memory that was synced out and dropped locally
+    can become a working kyo node again. A recalled memory that maps back
+    to an existing kyo node (via Hindsight provenance metadata) touches
+    that node instead of duplicating it; a memory with no such node is
+    materialized as a new one.
+    """
+    bridge = BridgeLayer()
+    stats = await bridge.materialize_from_hindsight(query, top_k)
+    if bridge.last_error:
+        raise ToolError(f"Error materializing from Hindsight: {bridge.last_error}")
+    if stats["recalled"] == 0:
+        return f"No results found for: '{query}'"
+    return (
+        f"Recalled {stats['recalled']} memor"
+        f"{'y' if stats['recalled'] == 1 else 'ies'} for '{query}': "
+        f"{stats['touched']} existing node(s) touched, "
+        f"{stats['created']} new node(s) materialized."
+    )
+
+
+@mcp.tool()
 async def trigger_reflection(query: str) -> str:
     """Trigger reflection in Hindsight to generate insights.
 
