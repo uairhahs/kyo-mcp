@@ -21,9 +21,12 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 import httpx
+from kyo_mcp.common import GENERATOR, now_iso
 from kyo_mcp.database import (
     clear_hindsight_operation,
+    create_concept,
     fail_hindsight_operation,
+    get_concept_by_id,
     get_failed_hindsight_operation,
     get_hindsight_operation,
     get_sync_hash,
@@ -31,6 +34,7 @@ from kyo_mcp.database import (
     query_catalog,
     set_hindsight_operation,
     set_sync_hash,
+    update_concept,
 )
 from kyo_mcp.okf_schema import (
     OKFConcept,
@@ -301,6 +305,19 @@ class BridgeLayer:
                             "content": content,
                             "tags": concept.tags or [],
                             "importance": 5,
+                            # Provenance back to the source kyo node.
+                            # Without this, a recalled memory is just text
+                            # with nothing to connect it back to the node
+                            # it came from, so materialize_from_hindsight
+                            # cannot tell a resync of an existing node from
+                            # a brand new one and would create a duplicate
+                            # on every call instead of touching the
+                            # original.
+                            "document_id": concept.id,
+                            "metadata": {
+                                "okf_id": concept.id,
+                                "concept_type": concept.type,
+                            },
                         }
                     ],
                     "async": True,
@@ -424,6 +441,80 @@ class BridgeLayer:
         except Exception as e:
             self._fail(f"Failed to recall from Hindsight: {e}")
             return []
+
+    async def materialize_from_hindsight(
+        self, query: str, top_k: int = 10
+    ) -> Dict[str, int]:
+        """Pull memories back from Hindsight into the local kyo catalogue.
+
+        recall_from_hindsight alone is a dead end: it hands back text for
+        one turn and nothing more, so a concept that was synced out to
+        Hindsight and then dropped locally could never be worked with
+        again as a kyo node. This closes that loop.
+
+        A recalled memory carrying an `okf_id` in its metadata (set by
+        sync_concept_to_hindsight) maps back to the kyo node it was
+        synced from. If that node still exists locally, it is "touched"
+        -- its updated_at is bumped via an empty update_concept call,
+        with content left untouched -- so it re-enters the actively-used
+        working set instead of only existing as one-off recalled text.
+        Memories with no resolvable okf_id (native Hindsight memories, or
+        ones synced before this provenance tracking existed) are
+        materialized as new concepts instead, deterministically id'd from
+        the Hindsight memory's own id. Recalling the same memory again
+        then hits that same id and is treated as a touch too, not a
+        second create.
+
+        Returns counts: recalled (total memories found), touched
+        (existing concepts refreshed), created (new concepts
+        materialized).
+        """
+        results = await self.recall_from_hindsight(query, top_k)
+        stats = {"recalled": len(results), "touched": 0, "created": 0}
+        if self.last_error:
+            return stats
+
+        for result in results:
+            text = result.get("text") or result.get("content") or ""
+            if not text:
+                continue
+
+            metadata = result.get("metadata") or {}
+            okf_id = metadata.get("okf_id") or result.get("document_id")
+
+            if okf_id and get_concept_by_id(okf_id, db_path=self.db_path):
+                update_concept(okf_id, {}, db_path=self.db_path)
+                stats["touched"] += 1
+                continue
+
+            memory_id = result.get("id") or _content_hash(text)
+            new_id = f"kyo-recall-{memory_id[:12]}"
+
+            # Already materialized by an earlier call (same Hindsight
+            # memory id, deterministic new_id): touch it rather than
+            # recreating it, same as the okf_id branch above.
+            if get_concept_by_id(new_id, db_path=self.db_path):
+                update_concept(new_id, {}, db_path=self.db_path)
+                stats["touched"] += 1
+                continue
+
+            title = result.get("context") or text[:80]
+            concept_dict = {
+                "id": new_id,
+                "type": "concept",
+                "title": title,
+                "description": text,
+                "tags": [*(result.get("tags") or []), "source:hindsight-recall"],
+                "status": "stable",
+                "generated": {"by": GENERATOR, "at": now_iso()},
+                "sources": [
+                    {"id": result.get("id") or new_id, "resource": "hindsight"}
+                ],
+            }
+            create_concept(concept_dict, markdown_body=text, db_path=self.db_path)
+            stats["created"] += 1
+
+        return stats
 
     async def trigger_reflection(self, query: str) -> Dict[str, Any]:
         """Trigger reflection in Hindsight.

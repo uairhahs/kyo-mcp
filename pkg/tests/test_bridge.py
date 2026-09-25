@@ -387,3 +387,172 @@ class TestRetainRetry:
 
         clear_hindsight_operation("n1")
         assert (await submit()).call_args.kwargs["json"]["operation_id"] == retry
+
+
+class TestHindsightRetainCarriesProvenance:
+    """materialize_from_hindsight can only map a recalled memory back to
+    its source kyo node if sync_concept_to_hindsight actually sends that
+    node's id along with the content."""
+
+    @pytest.mark.asyncio
+    async def test_retain_sends_document_id_and_okf_id_metadata(self):
+        bridge = BridgeLayer()
+        with patch(
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            return_value=_mock_response(200, hindsight.retain_response()),
+        ) as request:
+            await bridge.sync_concept_to_hindsight(_concept())
+        item = request.call_args.kwargs["json"]["items"][0]
+        assert item["document_id"] == "test-concept"
+        assert item["metadata"] == {
+            "okf_id": "test-concept",
+            "concept_type": "concept",
+        }
+
+
+class TestMaterializeFromHindsight:
+    """recall_from_hindsight alone only ever hands back text for one turn;
+    materialize_from_hindsight is what actually pulls a memory back into
+    the local catalogue, so a synced-and-dropped concept can be worked
+    with again."""
+
+    def _recall_response(self, results):
+        return _mock_response(200, hindsight.recall_response(results))
+
+    @pytest.mark.asyncio
+    async def test_touches_existing_node_mapped_by_okf_id(self):
+        from kyo_mcp.database import create_concept, get_concept_by_id
+
+        create_concept(
+            {
+                "id": "existing-node",
+                "type": "concept",
+                "title": "Existing",
+                "description": "Original content",
+            },
+            "Body",
+        )
+        before = get_concept_by_id("existing-node")["updated_at"]
+
+        bridge = BridgeLayer()
+        with patch(
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            return_value=self._recall_response(
+                [
+                    hindsight.recall_result(
+                        id="mem-1",
+                        text="Existing: Original content",
+                        okf_id="existing-node",
+                    )
+                ]
+            ),
+        ):
+            stats = await bridge.materialize_from_hindsight("existing")
+
+        assert stats == {"recalled": 1, "touched": 1, "created": 0}
+        after = get_concept_by_id("existing-node")
+        assert after["description"] == "Original content"  # content untouched
+        assert after["updated_at"] >= before
+
+    @pytest.mark.asyncio
+    async def test_creates_new_node_when_okf_id_unresolvable(self):
+        from kyo_mcp.database import get_concept_by_id
+
+        bridge = BridgeLayer()
+        with patch(
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            return_value=self._recall_response(
+                [
+                    hindsight.recall_result(
+                        id="mem-alice",
+                        text="Alice works at Google",
+                        context="work info",
+                        tags=["work"],
+                    )
+                ]
+            ),
+        ):
+            stats = await bridge.materialize_from_hindsight("alice")
+
+        assert stats == {"recalled": 1, "touched": 0, "created": 1}
+        created = get_concept_by_id("kyo-recall-mem-alice")
+        assert created is not None
+        assert created["title"] == "work info"
+        assert created["description"] == "Alice works at Google"
+        assert "source:hindsight-recall" in created["tags"]
+
+    @pytest.mark.asyncio
+    async def test_stale_okf_id_for_deleted_node_creates_new_node(self):
+        """A memory synced from a node that was later deleted locally has
+        no local node to touch, so it must fall back to materializing a
+        new one rather than silently doing nothing."""
+        from kyo_mcp.database import get_concept_by_id
+
+        bridge = BridgeLayer()
+        with patch(
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            return_value=self._recall_response(
+                [
+                    hindsight.recall_result(
+                        id="mem-orphan",
+                        text="Content from a deleted node",
+                        okf_id="long-since-deleted",
+                    )
+                ]
+            ),
+        ):
+            stats = await bridge.materialize_from_hindsight("orphan")
+
+        assert stats == {"recalled": 1, "touched": 0, "created": 1}
+        assert get_concept_by_id("kyo-recall-mem-orphan") is not None
+
+    @pytest.mark.asyncio
+    async def test_repeated_materialize_updates_rather_than_duplicates(self):
+        """Recalling the same native memory twice must touch the one
+        materialized node, not create a second copy."""
+        from kyo_mcp.database import query_catalog
+
+        bridge = BridgeLayer()
+        response = self._recall_response(
+            [hindsight.recall_result(id="mem-repeat", text="Some fact", context="ctx")]
+        )
+        with patch(
+            "httpx.AsyncClient.request", new_callable=AsyncMock, return_value=response
+        ):
+            await bridge.materialize_from_hindsight("fact")
+            stats = await bridge.materialize_from_hindsight("fact")
+
+        assert stats == {"recalled": 1, "touched": 1, "created": 0}
+        matches = [
+            c for c in query_catalog() if c["id"] == "kyo-recall-mem-repeat"
+        ]
+        assert len(matches) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_results_returns_zero_stats(self):
+        bridge = BridgeLayer()
+        with patch(
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            return_value=self._recall_response([]),
+        ):
+            stats = await bridge.materialize_from_hindsight("nothing")
+        assert stats == {"recalled": 0, "touched": 0, "created": 0}
+
+    @pytest.mark.asyncio
+    async def test_error_returns_zero_stats(self):
+        import httpx
+
+        bridge = BridgeLayer()
+        with patch(
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            side_effect=httpx.ConnectError("refused"),
+        ):
+            stats = await bridge.materialize_from_hindsight("q")
+        assert stats == {"recalled": 0, "touched": 0, "created": 0}
+        assert "refused" in bridge.last_error
