@@ -405,17 +405,15 @@ async def trigger_reflection(query: str) -> str:
     if not result:
         return "No reflections generated."
 
-    output = f"Reflection on: '{query}'\n---\n"
-    observations = result.get("observations", result.get("insights", []))
-    if observations:
-        for obs in observations:
-            if isinstance(obs, dict):
-                output += f"- {obs.get('text', obs.get('content', str(obs)))}\n"
-            else:
-                output += f"- {obs}\n"
-    else:
-        output += str(result)
-    return output
+    # Hindsight's actual ReflectResponse carries the answer as markdown in
+    # `text` (confirmed against its OpenAPI schema); this used to look for
+    # "observations"/"insights", which that response never has, so a real
+    # reflection always fell through to a raw dict dump below instead of
+    # the markdown Hindsight actually generated.
+    text = result.get("text")
+    if text:
+        return f"Reflection on: '{query}'\n---\n{text}"
+    return f"Reflection on: '{query}'\n---\n{result}"
 
 
 @mcp.tool()

@@ -435,8 +435,12 @@ class BridgeLayer:
             Reflection results
         """
         try:
+            # Hindsight's ReflectRequest has no "mode" field (confirmed
+            # against its OpenAPI schema); a stray one used to be sent
+            # here, harmless only because FastAPI silently drops unknown
+            # request fields rather than rejecting them.
             response = await self._hindsight_request(
-                "POST", "reflect", json={"query": query, "mode": "observations"}
+                "POST", "reflect", json={"query": query}
             )
 
             if response.status_code == 200:

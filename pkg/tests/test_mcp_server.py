@@ -1,8 +1,11 @@
 """Tests for MCP server tools."""
 
 import re
+from unittest.mock import AsyncMock, patch
 
 import pytest
+import tests.hindsight_fixtures as hindsight
+from kyo_mcp.bridge import BridgeLayer
 from kyo_mcp.database import get_concept_by_id
 from kyo_mcp.mcp_server import (
     create_kyo_node,
@@ -14,6 +17,7 @@ from kyo_mcp.mcp_server import (
     is_stale,
     link_kyo_nodes,
     search_knowledge,
+    trigger_reflection,
     unlink_kyo_nodes,
     update_kyo_node,
     verify_kyo_node,
@@ -287,6 +291,34 @@ class TestGetNodeTrustStatus:
     async def test_nonexistent_node(self):
         with pytest.raises(ToolError, match="not found"):
             await get_node_trust_status("nonexistent")
+
+
+class TestTriggerReflection:
+    """Hindsight's real ReflectResponse only ever carries a `text` field
+    (confirmed against its OpenAPI schema); this tool used to look for
+    "observations"/"insights" instead, a shape the real API never
+    returns, so a genuine reflection always fell through to a raw dict
+    dump. Mocked at the BridgeLayer level (the HTTP call itself is
+    covered in test_bridge.py) so this only tests the tool's own
+    response-to-text formatting."""
+
+    @pytest.mark.asyncio
+    async def test_surfaces_real_text_field(self):
+        with patch.object(
+            BridgeLayer,
+            "trigger_reflection",
+            AsyncMock(return_value=hindsight.reflect_response("## Findings\n\nIt works.")),
+        ):
+            output = await trigger_reflection("query")
+        assert "## Findings\n\nIt works." in output
+
+    @pytest.mark.asyncio
+    async def test_empty_result_reports_no_reflections(self):
+        with patch.object(
+            BridgeLayer, "trigger_reflection", AsyncMock(return_value={})
+        ):
+            output = await trigger_reflection("query")
+        assert output == "No reflections generated."
 
 
 class TestIsStale:

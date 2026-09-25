@@ -14,6 +14,7 @@ auth of its own.
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import tests.hindsight_fixtures as hindsight
 from kyo_mcp.bridge import BridgeLayer
 from kyo_mcp.okf_schema import OKFConcept
 
@@ -77,7 +78,7 @@ class TestHindsightCallsSendCorrectHeaders:
         with patch(
             "httpx.AsyncClient.request",
             new_callable=AsyncMock,
-            return_value=_mock_response(200, {"success": True}),
+            return_value=_mock_response(200, hindsight.retain_response()),
         ) as mock_post:
             await bridge.sync_concept_to_hindsight(_concept())
         assert mock_post.call_args.kwargs["headers"] == {}
@@ -88,7 +89,7 @@ class TestHindsightCallsSendCorrectHeaders:
         with patch(
             "httpx.AsyncClient.request",
             new_callable=AsyncMock,
-            return_value=_mock_response(200, {"success": True}),
+            return_value=_mock_response(200, hindsight.retain_response()),
         ) as mock_post:
             await bridge.sync_concept_to_hindsight(_concept())
         assert mock_post.call_args.kwargs["headers"] == {
@@ -107,7 +108,7 @@ class TestHindsightCallsSendCorrectHeaders:
             patch(
                 "httpx.AsyncClient.request",
                 new_callable=AsyncMock,
-                return_value=_mock_response(200, {"status": "pending"}),
+                return_value=_mock_response(200, hindsight.operation_status("pending")),
             ) as mock_get,
         ):
             await bridge.check_hindsight_operation("test-concept")
@@ -124,7 +125,7 @@ class TestHindsightCallsSendCorrectHeaders:
             patch(
                 "httpx.AsyncClient.request",
                 new_callable=AsyncMock,
-                return_value=_mock_response(200, {"status": "pending"}),
+                return_value=_mock_response(200, hindsight.operation_status("pending")),
             ) as mock_get,
         ):
             await bridge.check_hindsight_operation("test-concept")
@@ -139,7 +140,7 @@ class TestHindsightCallsSendCorrectHeaders:
         with patch(
             "httpx.AsyncClient.request",
             new_callable=AsyncMock,
-            return_value=_mock_response(200, {"results": []}),
+            return_value=_mock_response(200, hindsight.recall_response([])),
         ) as mock_post:
             await bridge.recall_from_hindsight("query")
         assert mock_post.call_args.kwargs["headers"] == {}
@@ -150,7 +151,7 @@ class TestHindsightCallsSendCorrectHeaders:
         with patch(
             "httpx.AsyncClient.request",
             new_callable=AsyncMock,
-            return_value=_mock_response(200, {"results": []}),
+            return_value=_mock_response(200, hindsight.recall_response([])),
         ) as mock_post:
             await bridge.recall_from_hindsight("query")
         assert mock_post.call_args.kwargs["headers"] == {
@@ -164,7 +165,7 @@ class TestHindsightCallsSendCorrectHeaders:
         with patch(
             "httpx.AsyncClient.request",
             new_callable=AsyncMock,
-            return_value=_mock_response(200, {"observations": []}),
+            return_value=_mock_response(200, hindsight.reflect_response("")),
         ) as mock_post:
             await bridge.trigger_reflection("query")
         assert mock_post.call_args.kwargs["headers"] == {}
@@ -175,7 +176,7 @@ class TestHindsightCallsSendCorrectHeaders:
         with patch(
             "httpx.AsyncClient.request",
             new_callable=AsyncMock,
-            return_value=_mock_response(200, {"observations": []}),
+            return_value=_mock_response(200, hindsight.reflect_response("")),
         ) as mock_post:
             await bridge.trigger_reflection("query")
         assert mock_post.call_args.kwargs["headers"] == {
@@ -189,7 +190,7 @@ class TestHindsightCallsSendCorrectHeaders:
         with patch(
             "httpx.AsyncClient.request",
             new_callable=AsyncMock,
-            return_value=_mock_response(200, {}),
+            return_value=_mock_response(200, hindsight.consolidation_response()),
         ) as mock_post:
             await bridge.trigger_consolidation()
         assert mock_post.call_args.kwargs["headers"] == {}
@@ -200,7 +201,7 @@ class TestHindsightCallsSendCorrectHeaders:
         with patch(
             "httpx.AsyncClient.request",
             new_callable=AsyncMock,
-            return_value=_mock_response(200, {}),
+            return_value=_mock_response(200, hindsight.consolidation_response()),
         ) as mock_post:
             await bridge.trigger_consolidation()
         assert mock_post.call_args.kwargs["headers"] == {
@@ -272,7 +273,7 @@ class TestSyncAll:
             patch(
                 "httpx.AsyncClient.request",
                 new_callable=AsyncMock,
-                return_value=_mock_response(200, {"status": "completed"}),
+                return_value=_mock_response(200, hindsight.operation_status("completed")),
             ),
             patch.object(
                 BridgeLayer, "sync_concept_to_mnemosyne", AsyncMock(return_value=True)
@@ -311,7 +312,7 @@ class TestBulkEfficiency:
             patch(
                 "httpx.AsyncClient.request",
                 new_callable=AsyncMock,
-                return_value=_mock_response(200, {}),
+                return_value=_mock_response(200, hindsight.retain_response()),
             ) as request,
             patch.object(
                 BridgeLayer, "sync_concept_to_mnemosyne", AsyncMock(return_value=True)
@@ -362,7 +363,7 @@ class TestRetainRetry:
             with patch(
                 "httpx.AsyncClient.request",
                 new_callable=AsyncMock,
-                return_value=_mock_response(200, {}),
+                return_value=_mock_response(200, hindsight.retain_response()),
             ) as request:
                 assert await bridge.sync_concept_to_hindsight(concept)
             return request
@@ -372,7 +373,7 @@ class TestRetainRetry:
         with patch(
             "httpx.AsyncClient.request",
             new_callable=AsyncMock,
-            return_value=_mock_response(200, {"status": "failed"}),
+            return_value=_mock_response(200, hindsight.operation_status("failed")),
         ):
             assert (await bridge.check_hindsight_operation("n1"))["state"] == "failed"
         assert get_hindsight_operation("n1") is None
