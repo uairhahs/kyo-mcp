@@ -119,6 +119,7 @@ successful results containing error text.
 | `HINDSIGHT_API_KEY`      | Bearer token for a Hindsight instance that requires auth                                                                          |
 | `HINDSIGHT_NAMESPACE`    | Hindsight namespace (default: `default`)                                                                                          |
 | `HINDSIGHT_BANK`         | Hindsight memory bank (default: `kyo`)                                                                                            |
+| `KYO_REFLECT_TIMEOUT`    | Seconds to wait for a Hindsight reflect (default: `1200`); keep it above the server's `HINDSIGHT_API_REFLECT_WALL_TIMEOUT`        |
 
 Every server process and the CLI can share one database; nothing is cached
 in memory, so writes from one are visible to the others immediately. The

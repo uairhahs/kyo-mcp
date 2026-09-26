@@ -65,10 +65,36 @@ STATUS_TIMEOUT = 30
 
 # Reflect is synchronous and agentic: Hindsight runs several tool-calling
 # LLM turns while this request stays open, each turn on a growing context.
-# On the homelab's failover path (a 2B model on an Intel iGPU reading ~10k
-# token prompts at ~60 tok/s) one turn alone takes about 3 minutes, so
-# LLM_TIMEOUT would abandon a reflect that is still making progress.
-REFLECT_TIMEOUT = 1200
+# On a small local model a whole reflect can take many minutes (a 2B model
+# on an Intel iGPU took about 14 minutes), so LLM_TIMEOUT would abandon a
+# reflect that is still making progress. KYO_REFLECT_TIMEOUT (seconds)
+# overrides the default; keep it above the server's own reflect limit
+# (Hindsight's HINDSIGHT_API_REFLECT_WALL_TIMEOUT) so the server reports its
+# timeout instead of the client giving up first.
+DEFAULT_REFLECT_TIMEOUT = 1200.0
+
+
+def reflect_timeout() -> float:
+    """Seconds to wait for a reflect: KYO_REFLECT_TIMEOUT, else the default.
+
+    Read at call time, like KYO_DB_PATH, so a changed environment takes
+    effect without re-importing. A non-numeric or non-positive value is
+    ignored with a warning rather than failing the reflect.
+    """
+    raw = os.environ.get("KYO_REFLECT_TIMEOUT")
+    if not raw:
+        return DEFAULT_REFLECT_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.0
+    if value <= 0:
+        logger.warning(
+            f"Ignoring KYO_REFLECT_TIMEOUT={raw!r}: expected a positive number "
+            f"of seconds; using {DEFAULT_REFLECT_TIMEOUT:g}"
+        )
+        return DEFAULT_REFLECT_TIMEOUT
+    return value
 
 # Cap on concurrent Hindsight requests during a bulk sync. Retains are
 # submitted with async=true, so each request only enqueues work; the cap
@@ -538,7 +564,7 @@ class BridgeLayer:
             # here, harmless only because FastAPI silently drops unknown
             # request fields rather than rejecting them.
             response = await self._hindsight_request(
-                "POST", "reflect", json={"query": query}, timeout=REFLECT_TIMEOUT
+                "POST", "reflect", json={"query": query}, timeout=reflect_timeout()
             )
 
             if response.status_code == 200:
