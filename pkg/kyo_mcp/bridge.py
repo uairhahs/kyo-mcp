@@ -63,6 +63,13 @@ LLM_TIMEOUT = 180
 # Status polls don't touch the LLM pipeline, so they can fail fast.
 STATUS_TIMEOUT = 30
 
+# Reflect is synchronous and agentic: Hindsight runs several tool-calling
+# LLM turns while this request stays open, each turn on a growing context.
+# On the homelab's failover path (a 2B model on an Intel iGPU reading ~10k
+# token prompts at ~60 tok/s) one turn alone takes about 3 minutes, so
+# LLM_TIMEOUT would abandon a reflect that is still making progress.
+REFLECT_TIMEOUT = 1200
+
 # Cap on concurrent Hindsight requests during a bulk sync. Retains are
 # submitted with async=true, so each request only enqueues work; the cap
 # just keeps a large catalogue from opening hundreds of sockets at once.
@@ -531,7 +538,7 @@ class BridgeLayer:
             # here, harmless only because FastAPI silently drops unknown
             # request fields rather than rejecting them.
             response = await self._hindsight_request(
-                "POST", "reflect", json={"query": query}
+                "POST", "reflect", json={"query": query}, timeout=REFLECT_TIMEOUT
             )
 
             if response.status_code == 200:
