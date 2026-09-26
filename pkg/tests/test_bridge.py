@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import tests.hindsight_fixtures as hindsight
-from kyo_mcp.bridge import BridgeLayer
+from kyo_mcp.bridge import DEFAULT_REFLECT_TIMEOUT, BridgeLayer, reflect_timeout
 from kyo_mcp.okf_schema import OKFConcept
 
 
@@ -182,6 +182,18 @@ class TestHindsightCallsSendCorrectHeaders:
         assert mock_post.call_args.kwargs["headers"] == {
             "Authorization": "Bearer hsk_test123"
         }
+
+    @pytest.mark.asyncio
+    async def test_trigger_reflection_uses_reflect_timeout(self, monkeypatch):
+        monkeypatch.setenv("KYO_REFLECT_TIMEOUT", "900")
+        bridge = BridgeLayer(hindsight_api_key=None)
+        with patch(
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            return_value=_mock_response(200, hindsight.reflect_response("")),
+        ) as mock_post:
+            await bridge.trigger_reflection("query")
+        assert mock_post.call_args.kwargs["timeout"] == 900.0
 
     @pytest.mark.asyncio
     async def test_trigger_consolidation_no_key(self, monkeypatch):
@@ -556,3 +568,18 @@ class TestMaterializeFromHindsight:
             stats = await bridge.materialize_from_hindsight("q")
         assert stats == {"recalled": 0, "touched": 0, "created": 0}
         assert "refused" in bridge.last_error
+
+
+class TestReflectTimeout:
+    def test_default_when_unset(self, monkeypatch):
+        monkeypatch.delenv("KYO_REFLECT_TIMEOUT", raising=False)
+        assert reflect_timeout() == DEFAULT_REFLECT_TIMEOUT
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv("KYO_REFLECT_TIMEOUT", "450.5")
+        assert reflect_timeout() == 450.5
+
+    @pytest.mark.parametrize("raw", ["soon", "0", "-5"])
+    def test_invalid_values_fall_back_to_default(self, monkeypatch, raw):
+        monkeypatch.setenv("KYO_REFLECT_TIMEOUT", raw)
+        assert reflect_timeout() == DEFAULT_REFLECT_TIMEOUT
