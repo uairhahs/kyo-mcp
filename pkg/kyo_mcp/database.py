@@ -142,6 +142,13 @@ def _migrate_v5(cursor: sqlite3.Cursor) -> None:
     _add_columns(cursor, ["hindsight_failed_operation_id"])
 
 
+def _migrate_v6(cursor: sqlite3.Cursor) -> None:
+    """The id Mnemosyne returned for each node's current memory. Mnemosyne
+    can only forget a memory by id, so without it a deleted or rewritten
+    node's memory stays behind forever."""
+    _add_columns(cursor, ["mnemosyne_memory_id"])
+
+
 # Append-only: each entry upgrades the schema from version i to i + 1, and
 # PRAGMA user_version records how many have been applied.
 MIGRATIONS: List[Callable[[sqlite3.Cursor], None]] = [
@@ -150,6 +157,7 @@ MIGRATIONS: List[Callable[[sqlite3.Cursor], None]] = [
     _migrate_v3,
     _migrate_v4,
     _migrate_v5,
+    _migrate_v6,
 ]
 
 
@@ -555,6 +563,30 @@ def set_sync_hash(
         conn.execute(
             f"UPDATE knowledge_concepts SET {column} = ? WHERE id = ?",  # nosec B608
             (content_hash, node_id),
+        )
+
+
+def get_mnemosyne_memory_id(
+    node_id: str, db_path: Optional[Path] = None
+) -> Optional[str]:
+    """Return the id of this node's current Mnemosyne memory, or None if
+    it was never synced (or was synced before ids were tracked)."""
+    conn = get_connection(db_path)
+    row = conn.execute(
+        "SELECT mnemosyne_memory_id FROM knowledge_concepts WHERE id = ?",
+        (node_id,),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def set_mnemosyne_memory_id(
+    node_id: str, memory_id: Optional[str], db_path: Optional[Path] = None
+) -> None:
+    conn = get_connection(db_path)
+    with _lock, conn:
+        conn.execute(
+            "UPDATE knowledge_concepts SET mnemosyne_memory_id = ? WHERE id = ?",
+            (memory_id, node_id),
         )
 
 

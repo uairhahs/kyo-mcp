@@ -29,10 +29,12 @@ from kyo_mcp.database import (
     get_concept_by_id,
     get_failed_hindsight_operation,
     get_hindsight_operation,
+    get_mnemosyne_memory_id,
     get_sync_hash,
     list_pending_hindsight_operations,
     query_catalog,
     set_hindsight_operation,
+    set_mnemosyne_memory_id,
     set_sync_hash,
     touch_concept,
 )
@@ -246,11 +248,11 @@ class BridgeLayer:
 
             # Imported only once there is something to sync: the import
             # alone takes ~0.6s, which an unchanged concept shouldn't pay.
-            from mnemosyne import remember
+            from mnemosyne import forget, remember
 
             # remember() is synchronous and may do disk or model work, so
             # it runs in a worker thread to keep the event loop free.
-            await asyncio.to_thread(
+            memory_id = await asyncio.to_thread(
                 remember,
                 content,
                 metadata={
@@ -262,6 +264,13 @@ class BridgeLayer:
                     "created_at": concept.generated.at if concept.generated else None,
                 },
             )
+            # The node's content changed, so its previous memory is stale;
+            # forgetting it keeps one memory per node instead of one per
+            # edit.
+            previous_id = get_mnemosyne_memory_id(concept.id, db_path=self.db_path)
+            if previous_id and previous_id != memory_id:
+                await asyncio.to_thread(forget, previous_id)
+            set_mnemosyne_memory_id(concept.id, memory_id, db_path=self.db_path)
             set_sync_hash(concept.id, "mnemosyne", new_hash, db_path=self.db_path)
             logger.info(f"Synced concept {concept.id} to Mnemosyne")
             return True
@@ -373,6 +382,58 @@ class BridgeLayer:
         except Exception as e:
             self._fail(f"Failed to submit concept {concept.id} to Hindsight: {e}")
             return False
+
+    async def delete_concept_from_memory_systems(self, node_id: str) -> Dict[str, str]:
+        """Remove what a node synced to Hindsight and Mnemosyne, so a
+        deleted node can't be recalled or materialized back into the
+        catalogue.
+
+        Hindsight: any in-flight retain is cancelled, then the node's
+        document (document_id is the node id) is deleted along with every
+        fact extracted from it. Mnemosyne: the node's tracked memory is
+        forgotten.
+
+        Returns a status per system: "deleted", "not_found" (nothing
+        there to delete), "untracked" (Mnemosyne only: synced before
+        memory ids were recorded, so it can't be found), or "error" with
+        last_error set. Local state is left untouched either way.
+        """
+        result = {"hindsight": "error", "mnemosyne": "error"}
+        try:
+            pending = get_hindsight_operation(node_id, db_path=self.db_path)
+            if pending:
+                response = await self._hindsight_request(
+                    "DELETE", f"operations/{pending[0]}", timeout=STATUS_TIMEOUT
+                )
+                if response.status_code not in (200, 404):
+                    raise RuntimeError(
+                        f"cancelling operation {pending[0]}: "
+                        f"HTTP {response.status_code} - {response.text}"
+                    )
+            response = await self._hindsight_request(
+                "DELETE", f"documents/{node_id}", timeout=STATUS_TIMEOUT
+            )
+            if response.status_code == 200:
+                result["hindsight"] = "deleted"
+            elif response.status_code == 404:
+                result["hindsight"] = "not_found"
+            else:
+                raise RuntimeError(f"HTTP {response.status_code} - {response.text}")
+        except Exception as e:
+            self._fail(f"Failed to delete {node_id} from Hindsight: {e}")
+
+        memory_id = get_mnemosyne_memory_id(node_id, db_path=self.db_path)
+        if not memory_id:
+            result["mnemosyne"] = "untracked"
+            return result
+        try:
+            from mnemosyne import forget
+
+            forgotten = await asyncio.to_thread(forget, memory_id)
+            result["mnemosyne"] = "deleted" if forgotten else "not_found"
+        except Exception as e:
+            self._fail(f"Failed to delete {node_id} from Mnemosyne: {e}")
+        return result
 
     async def check_hindsight_operation(self, node_id: str) -> Dict[str, Any]:
         """Poll the status of a node's in-flight Hindsight sync operation.

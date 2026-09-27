@@ -63,7 +63,7 @@ Assumes Hindsight is reachable at `http://localhost:8888`; set
 | `create_kyo_node`             | Create an OKF node (status, `stale_after`, sources, body)        |
 | `get_kyo_node`                | Get a node as an OKF markdown bundle file or as Turtle RDF       |
 | `update_kyo_node`             | Update some fields of a node, keeping its verification history   |
-| `delete_kyo_node`             | Delete a node and its links                                      |
+| `delete_kyo_node`             | Delete a node, its links, and its synced memories                |
 | `link_kyo_nodes`              | Connect two nodes with a directed, typed edge                    |
 | `unlink_kyo_nodes`            | Remove links between two nodes                                   |
 | `get_node_links`              | List a node's incoming and/or outgoing links                     |
@@ -168,6 +168,7 @@ The `kyo-cli` command works on the same database and prints JSON:
 uv run kyo-cli create_concept "Title" "Summary" --content "# Markdown body"
 uv run kyo-cli search_concepts some words --limit 5
 uv run kyo-cli get_concept kyo-0123456789ab
+uv run kyo-cli delete_concept kyo-0123456789ab   # also removes its synced memories
 uv run kyo-cli sync_all
 uv run kyo-cli export_bundle ~/kyo-bundle      # --overwrite to refresh it
 uv run kyo-cli import_bundle path/to/bundle

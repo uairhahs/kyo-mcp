@@ -197,14 +197,29 @@ async def update_kyo_node(
 
 
 @kyo_tool
-async def delete_kyo_node(node_id: str) -> str:
-    """Delete a node and every link to or from it.
+async def delete_kyo_node(node_id: str, local_only: bool = False) -> str:
+    """Delete a node and every link to or from it, along with what it
+    synced to Hindsight and Mnemosyne.
 
-    Memories already synced to Mnemosyne or Hindsight are not removed.
+    If the remote delete fails, the node is kept so the delete can be
+    retried; local_only=True deletes it locally regardless and leaves any
+    synced memories behind.
     """
-    if not store.delete_concept(node_id):
-        raise ToolError(f"Node {node_id} not found in catalogue.")
-    return f"Node {node_id} deleted"
+    _require_node(node_id)
+    remote = ""
+    if not local_only:
+        bridge = BridgeLayer()
+        result = await bridge.delete_concept_from_memory_systems(node_id)
+        if bridge.last_error:
+            raise ToolError(
+                f"Node {node_id} not deleted: {bridge.last_error}. "
+                "Retry, or pass local_only=True to delete it locally only."
+            )
+        remote = (
+            f" (hindsight: {result['hindsight']}, mnemosyne: {result['mnemosyne']})"
+        )
+    store.delete_concept(node_id)
+    return f"Node {node_id} deleted{remote}"
 
 
 @kyo_tool

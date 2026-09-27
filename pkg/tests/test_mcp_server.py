@@ -146,9 +146,42 @@ class TestUpdateAndDelete:
         a = await make_node("A")
         b = await make_node("B")
         await link_kyo_nodes(a, b, "references")
-        await delete_kyo_node(b)
+        with patch.object(
+            BridgeLayer,
+            "delete_concept_from_memory_systems",
+            AsyncMock(return_value={"hindsight": "deleted", "mnemosyne": "deleted"}),
+        ) as remote:
+            result = await delete_kyo_node(b)
+        remote.assert_awaited_once_with(b)
+        assert "hindsight: deleted" in result
         assert get_concept_by_id(b) is None
         assert "no both links" in await get_node_links(a)
+
+    @pytest.mark.asyncio
+    async def test_delete_keeps_node_when_remote_delete_fails(self):
+        """Deleting locally after a failed remote delete would orphan the
+        synced memories, and materialize_from_hindsight would bring the
+        node back under a new id."""
+        a = await make_node("A")
+
+        async def fail(self, node_id):
+            self.last_error = "Hindsight down"
+            return {"hindsight": "error", "mnemosyne": "untracked"}
+
+        with patch.object(BridgeLayer, "delete_concept_from_memory_systems", fail):
+            with pytest.raises(ToolError, match="Hindsight down"):
+                await delete_kyo_node(a)
+        assert get_concept_by_id(a) is not None
+
+    @pytest.mark.asyncio
+    async def test_delete_local_only_skips_memory_systems(self):
+        a = await make_node("A")
+        with patch.object(
+            BridgeLayer, "delete_concept_from_memory_systems", AsyncMock()
+        ) as remote:
+            await delete_kyo_node(a, local_only=True)
+        remote.assert_not_awaited()
+        assert get_concept_by_id(a) is None
 
     @pytest.mark.asyncio
     async def test_delete_missing(self):
@@ -308,7 +341,9 @@ class TestTriggerReflection:
         with patch.object(
             BridgeLayer,
             "trigger_reflection",
-            AsyncMock(return_value=hindsight.reflect_response("## Findings\n\nIt works.")),
+            AsyncMock(
+                return_value=hindsight.reflect_response("## Findings\n\nIt works.")
+            ),
         ):
             output = await trigger_reflection("query")
         assert "## Findings\n\nIt works." in output

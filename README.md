@@ -96,7 +96,7 @@ kyo/
 | `create_kyo_node`             | Create an OKF node (status, `stale_after`, sources, body)        |
 | `get_kyo_node`                | Get a node as an OKF markdown bundle file or as Turtle RDF       |
 | `update_kyo_node`             | Update some fields of a node, keeping its verification history   |
-| `delete_kyo_node`             | Delete a node and its links                                      |
+| `delete_kyo_node`             | Delete a node, its links, and its synced memories                |
 | `link_kyo_nodes`              | Connect two nodes with a directed, typed edge                    |
 | `unlink_kyo_nodes`            | Remove links between two nodes                                   |
 | `get_node_links`              | List a node's incoming and/or outgoing links                     |

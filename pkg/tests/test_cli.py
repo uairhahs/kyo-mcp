@@ -75,3 +75,45 @@ async def test_trigger_reflection_unknown_concept(capsys):
     code, _, err = await run_cli(capsys, "trigger_reflection", "--concept-id", "nope")
     assert code == 1
     assert "not found" in err["error"]
+
+
+@pytest.mark.asyncio
+async def test_delete_concept_removes_it_everywhere(capsys):
+    _, created, _ = await run_cli(capsys, "create_concept", "Gone", "Soon")
+    concept_id = created["concept_id"]
+    with patch.object(
+        BridgeLayer,
+        "delete_concept_from_memory_systems",
+        AsyncMock(return_value={"hindsight": "deleted", "mnemosyne": "untracked"}),
+    ):
+        code, out, _ = await run_cli(capsys, "delete_concept", concept_id)
+    assert code == 0
+    assert out == {
+        "deleted": True,
+        "concept_id": concept_id,
+        "hindsight": "deleted",
+        "mnemosyne": "untracked",
+    }
+    code, _, err = await run_cli(capsys, "get_concept", concept_id)
+    assert code == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_concept_kept_when_remote_delete_fails(capsys):
+    _, created, _ = await run_cli(capsys, "create_concept", "Kept", "Here")
+    concept_id = created["concept_id"]
+
+    async def fail(self, node_id):
+        self.last_error = "Hindsight down"
+        return {"hindsight": "error", "mnemosyne": "untracked"}
+
+    with patch.object(BridgeLayer, "delete_concept_from_memory_systems", fail):
+        code, _, err = await run_cli(capsys, "delete_concept", concept_id)
+    assert code == 1
+    assert "Hindsight down" in err["error"]
+    code, _, _ = await run_cli(capsys, "get_concept", concept_id)
+    assert code == 0
+
+    code, out, _ = await run_cli(capsys, "delete_concept", concept_id, "--local-only")
+    assert code == 0
+    assert out == {"deleted": True, "concept_id": concept_id}
