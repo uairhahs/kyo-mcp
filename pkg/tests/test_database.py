@@ -481,7 +481,7 @@ class TestRegressions:
             }
         )
         result = get_concept_by_id("fresh")
-        assert result["stale_after"] == "2030-01-01"
+        assert result["stale_after"] == "2030-01-01T00:00:00Z"
         assert result["metadata"] == {"owner": "team-a"}
 
     def test_upsert_keeps_verification_history(self):

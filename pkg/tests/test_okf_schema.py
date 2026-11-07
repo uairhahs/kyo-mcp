@@ -100,7 +100,8 @@ class TestToMarkdown:
         frontmatter = yaml.safe_load(md.split("---\n")[1])
         assert frontmatter["type"] == "concept"
         assert frontmatter["status"] == "draft"
-        assert frontmatter["stale_after"] == "2030-01-01"
+        # §5: a bare date is normalised to an instant with an offset.
+        assert frontmatter["stale_after"] == "2030-01-01T00:00:00Z"
         assert frontmatter["verified"][0]["by"] == "human:alice"
         assert frontmatter["sources"] == [{"resource": "https://example.com"}]
         assert frontmatter["owner"] == "team-a"

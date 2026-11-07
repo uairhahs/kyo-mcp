@@ -5,30 +5,31 @@ Specifically enforces strict `generated`, `verified`, and `sources` structures d
 
 MCP 2026-07-28 spec: stateless protocol, MRTR, Streamable HTTP transport.
 
-SQLite is the only source of truth. Several server processes (one per
-stdio client, plus the CLI) can share one database, so no graph state is
-cached in memory; graph algorithms build a NetworkX view on demand.
+The bundle of OKF concept files is the source of truth (kyo_mcp/store.py);
+SQLite is an index derived from it. Every tool first refreshes the index
+from the files, so edits made to them directly are always seen, and every
+write goes through the store, which writes the file before indexing it.
+Several server processes (one per stdio client, plus the CLI) can share one
+store, so no graph state is cached in memory; graph algorithms build a
+NetworkX view on demand.
 """
 
+import functools
 import itertools
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 import networkx as nx
+from kyo_mcp import store
 from kyo_mcp.bridge import BridgeLayer
+from kyo_mcp.bundle import BundleError, export_bundle, import_bundle, validate_bundle
 from kyo_mcp.common import GENERATOR, is_stale, new_node_id, now_iso
 from kyo_mcp.database import (
-    create_concept,
-    create_link,
-    delete_concept,
-    delete_link,
     get_all_links,
     get_concept_by_id,
     get_links,
     query_catalog,
-    update_concept,
-    update_node_verified,
 )
 from kyo_mcp.okf_schema import (
     ConceptStatus,
@@ -49,6 +50,18 @@ mcp = MCPServer(
 )
 
 
+def kyo_tool(fn):
+    """Register an MCP tool that first refreshes the index from the bundle,
+    so every tool sees the files as they are now."""
+
+    @functools.wraps(fn)
+    async def refreshed(*args, **kwargs):
+        store.refresh()
+        return await fn(*args, **kwargs)
+
+    return mcp.tool()(refreshed)
+
+
 def build_graph(db_path: Optional[Path] = None) -> nx.MultiDiGraph:
     """Build a fresh directed graph of every concept and link. A multigraph,
     since two nodes can be linked by several relation types."""
@@ -67,7 +80,7 @@ def _require_node(node_id: str) -> Dict[str, Any]:
     return node
 
 
-@mcp.tool()
+@kyo_tool
 async def create_kyo_node(
     title: str,
     description: str,
@@ -82,7 +95,8 @@ async def create_kyo_node(
     """Create a new knowledge node in the Kyo Knowledge Catalogue (OKF v0.2).
 
     Implements Trust Signals: `generated` (always), and optional `sources`.
-    Implements Freshness: `stale_after` (ISO 8601 date or timestamp).
+    Implements Freshness: `stale_after` (ISO 8601 timestamp; a bare date
+    is stored as midnight UTC, per OKF §5).
     `body` is the node's markdown body; a minimal one is generated from the
     title and description when omitted.
     """
@@ -101,20 +115,23 @@ async def create_kyo_node(
     )
     markdown_body = body or f"# {title}\n\n{description}\n"
 
-    # update_existing=False: an id collision must fail, never overwrite.
-    create_concept(
-        okf_schema.model_dump(mode="python"), markdown_body, update_existing=False
+    # create=True: an id collision must fail, never overwrite.
+    saved = store.save_concept(
+        okf_schema.model_dump(mode="python"), markdown_body, create=True
+    )
+    file = store.concept_file(saved["bundle_path"])
+    return (
+        f"Node created successfully: {okf_schema.id} ({okf_schema.title}) | "
+        f"Trust Tier: Unverified | File: {file}"
     )
 
-    return f"Node created successfully: {okf_schema.id} ({okf_schema.title}) | Trust Tier: Unverified"
 
-
-@mcp.tool()
+@kyo_tool
 async def get_kyo_node(
     node_id: str, format: Literal["markdown", "turtle"] = "markdown"
 ) -> str:
-    """Get a node as an OKF markdown bundle file (frontmatter plus body,
-    followed by its links) or as Turtle RDF."""
+    """Get a node as its OKF concept file, exactly as stored (followed by a
+    summary of its links), or as Turtle RDF."""
     node = _require_node(node_id)
     concept = OKFConcept.model_validate(node)
 
@@ -129,7 +146,10 @@ async def get_kyo_node(
             links=get_links(node_id, direction="out"),
         )
 
-    output = concept.to_markdown(node.get("body_text") or "")
+    output = store.read_concept_file(node_id) or concept.to_markdown(
+        node.get("body_text") or ""
+    )
+    output += f"\n<!-- file: {store.concept_file(node['bundle_path'])} -->\n"
     links = get_links(node_id)
     if links:
         output += "\n## Links\n\n"
@@ -138,7 +158,7 @@ async def get_kyo_node(
     return output
 
 
-@mcp.tool()
+@kyo_tool
 async def update_kyo_node(
     node_id: str,
     title: Optional[str] = None,
@@ -170,24 +190,24 @@ async def update_kyo_node(
         raise ToolError("Nothing to update: pass at least one field.")
     changes["generated"] = {"by": GENERATOR, "at": now_iso()}
 
-    updated = update_concept(node_id, changes, markdown_body=body)
+    updated = store.update_concept(node_id, changes, body=body)
     if updated is None:
         raise ToolError(f"Node {node_id} not found in catalogue.")
     return f"Node {node_id} updated ({updated['title']})"
 
 
-@mcp.tool()
+@kyo_tool
 async def delete_kyo_node(node_id: str) -> str:
     """Delete a node and every link to or from it.
 
     Memories already synced to Mnemosyne or Hindsight are not removed.
     """
-    if not delete_concept(node_id):
+    if not store.delete_concept(node_id):
         raise ToolError(f"Node {node_id} not found in catalogue.")
     return f"Node {node_id} deleted"
 
 
-@mcp.tool()
+@kyo_tool
 async def link_kyo_nodes(source_id: str, target_id: str, relation_type: str) -> str:
     """Connect two knowledge nodes (create a directed edge), e.g. with
     relation_type 'references' or 'derives_from'."""
@@ -195,23 +215,32 @@ async def link_kyo_nodes(source_id: str, target_id: str, relation_type: str) -> 
     if missing:
         raise ToolError(f"Node(s) not found in catalogue: {', '.join(missing)}")
 
-    create_link(source_id, target_id, relation_type)
+    store.add_link(source_id, target_id, relation_type)
     return f"Linked {source_id} -> {target_id} ({relation_type})"
 
 
-@mcp.tool()
+@kyo_tool
 async def unlink_kyo_nodes(
     source_id: str, target_id: str, relation_type: Optional[str] = None
 ) -> str:
     """Remove the link(s) from source to target. Without relation_type,
-    every relation between the two (in that direction) is removed."""
-    removed = delete_link(source_id, target_id, relation_type)
+    every relation between the two (in that direction) is removed. A link
+    written in the source's body text stays until the body is edited."""
+    removed, in_body = store.remove_link(source_id, target_id, relation_type)
+    note = (
+        f"; {source_id}'s body still links to {target_id}, so a "
+        "'references' link remains until that text is edited"
+        if in_body
+        else ""
+    )
     if not removed:
+        if in_body:
+            raise ToolError(f"No typed link from {source_id} to {target_id}{note}.")
         raise ToolError(f"No matching link from {source_id} to {target_id}.")
-    return f"Removed {removed} link(s) {source_id} -> {target_id}"
+    return f"Removed {removed} link(s) {source_id} -> {target_id}{note}"
 
 
-@mcp.tool()
+@kyo_tool
 async def get_node_links(
     node_id: str, direction: Literal["in", "out", "both"] = "both"
 ) -> str:
@@ -233,7 +262,7 @@ async def get_node_links(
     return f"Links for {node_id}:\n" + "\n".join(lines)
 
 
-@mcp.tool()
+@kyo_tool
 async def find_path(source_id: str, target_id: str, directed: bool = True) -> str:
     """Find the shortest chain of links between two nodes. With
     directed=False, links may be followed in either direction."""
@@ -254,7 +283,7 @@ async def find_path(source_id: str, target_id: str, directed: bool = True) -> st
     return "\n".join(steps)
 
 
-@mcp.tool()
+@kyo_tool
 async def search_knowledge(
     search_term: str = "", concept_type: str = "all", limit: int = 20
 ) -> str:
@@ -281,18 +310,18 @@ async def search_knowledge(
     return output
 
 
-@mcp.tool()
+@kyo_tool
 async def verify_kyo_node(node_id: str, human_actor: str) -> str:
     """Mark a node as human-verified to shift its trust tier to 'Human-Reviewed' (OKF §5.3)."""
     # Stored as "human:<actor>"; a "human:" prefix on the input is accepted.
     event = {"by": human_actor, "at": now_iso()}
-    if not update_node_verified(node_id, event):
+    if not store.verify_concept(node_id, event):
         raise ToolError(f"Node {node_id} not found in catalogue.")
     actor = human_actor.removeprefix("human:")
     return f"Node {node_id} marked as **Human-Reviewed** by human:{actor}"
 
 
-@mcp.tool()
+@kyo_tool
 async def get_node_trust_status(node_id: str) -> str:
     """Retrieve the full trust and provenance metadata for a node."""
     r = _require_node(node_id)
@@ -311,7 +340,7 @@ Sources: {len(r.get("sources", []))} attached.
     """.strip()
 
 
-@mcp.tool()
+@kyo_tool
 async def sync_to_mnemosyne(node_id: str) -> str:
     """Sync a knowledge node to Mnemosyne for spaced repetition.
 
@@ -324,7 +353,7 @@ async def sync_to_mnemosyne(node_id: str) -> str:
     return f"Synced {node_id} ({concept.title}) to Mnemosyne for spaced repetition"
 
 
-@mcp.tool()
+@kyo_tool
 async def sync_to_hindsight(node_id: str) -> str:
     """Queue a knowledge node for Hindsight fact extraction.
 
@@ -344,7 +373,7 @@ async def sync_to_hindsight(node_id: str) -> str:
     )
 
 
-@mcp.tool()
+@kyo_tool
 async def check_hindsight_sync_status(node_id: str) -> str:
     """Check the status of a node's Hindsight fact-extraction sync.
 
@@ -374,7 +403,7 @@ async def check_hindsight_sync_status(node_id: str) -> str:
     )
 
 
-@mcp.tool()
+@kyo_tool
 async def recall_from_hindsight(query: str, top_k: int = 5) -> str:
     """Recall memories from Hindsight using semantic search.
 
@@ -394,7 +423,7 @@ async def recall_from_hindsight(query: str, top_k: int = 5) -> str:
     return output
 
 
-@mcp.tool()
+@kyo_tool
 async def materialize_from_hindsight(query: str, top_k: int = 10) -> str:
     """Pull memories back from Hindsight into kyo's local catalogue.
 
@@ -419,7 +448,7 @@ async def materialize_from_hindsight(query: str, top_k: int = 10) -> str:
     )
 
 
-@mcp.tool()
+@kyo_tool
 async def trigger_reflection(query: str) -> str:
     """Trigger reflection in Hindsight to generate insights.
 
@@ -443,7 +472,7 @@ async def trigger_reflection(query: str) -> str:
     return f"Reflection on: '{query}'\n---\n{result}"
 
 
-@mcp.tool()
+@kyo_tool
 async def trigger_consolidation() -> str:
     """Trigger consolidation in Hindsight.
 
@@ -455,7 +484,7 @@ async def trigger_consolidation() -> str:
     return "Consolidation triggered successfully"
 
 
-@mcp.tool()
+@kyo_tool
 async def sync_all_to_memory_systems() -> str:
     """Sync all knowledge nodes to Mnemosyne and Hindsight.
 
@@ -472,6 +501,123 @@ async def sync_all_to_memory_systems() -> str:
     output += f"  Hindsight extractions completed since last check: {stats['hindsight_completed']}\n"
     if bridge.last_error:
         output += f"  Last error: {bridge.last_error}\n"
+    return output
+
+
+def _format_problems(problems: List[Dict[str, str]], limit: int = 20) -> str:
+    lines = [f"  - {p['path']} [{p['rule']}] {p['message']}" for p in problems[:limit]]
+    if len(problems) > limit:
+        lines.append(f"  ... and {len(problems) - limit} more")
+    return "\n".join(lines)
+
+
+@kyo_tool
+async def export_okf_bundle(out_dir: str, overwrite: bool = False) -> str:
+    """Write a standalone copy of the catalogue as an OKF v0.2 bundle: the
+    store's concept files, copied byte for byte, plus an index.md in every
+    directory (docs/SPEC.md §8).
+
+    out_dir must be missing or empty. With overwrite=True it may instead
+    hold a previous Kyo export, whose files are replaced. Output is
+    deterministic, so an unchanged catalogue exports to identical files.
+    """
+    try:
+        result = export_bundle(out_dir, overwrite=overwrite)
+    except BundleError as e:
+        raise ToolError(str(e)) from e
+    validation = result["validation"]
+    output = (
+        f"Exported {result['concepts']} concept(s) to {result['bundle']}\n"
+        f"  Index files: {result['index_files']}\n"
+        f"  OKF v0.2 conformant: {'yes' if validation['conformant'] else 'NO'}\n"
+    )
+    if validation["errors"]:
+        output += _format_problems(validation["errors"]) + "\n"
+    return output
+
+
+@kyo_tool
+async def import_okf_bundle(bundle_dir: str) -> str:
+    """Copy an OKF bundle's concept files into the catalogue's store, byte
+    for byte and at the same paths, then index them. A file whose id (its
+    `kyo_id`, else one derived from its path) is already in the store
+    replaces that concept. Conflicting files and files that aren't concept
+    documents are skipped and reported. Broken links are kept as text."""
+    try:
+        result = import_bundle(bundle_dir)
+    except BundleError as e:
+        raise ToolError(str(e)) from e
+    output = (
+        f"Imported {result['concepts']} concept(s) from {result['bundle']}\n"
+        f"  Created: {result['created']}, updated: {result['updated']}, "
+        f"unchanged: {result['unchanged']}\n"
+        f"  Store: {result['store']}\n"
+    )
+    if result["broken_links"]:
+        output += (
+            "  Broken links (kept in the text, not linked): "
+            f"{len(result['broken_links'])}\n"
+        )
+    for title, items in (("Skipped files", result["skipped"]),):
+        if items:
+            output += (
+                f"  {title}:\n"
+                + "\n".join(f"  - {i['path']}: {i['reason']}" for i in items)
+                + "\n"
+            )
+    if result["warnings"]:
+        output += (
+            "  Warnings:\n"
+            + _format_problems([{**w, "rule": "id"} for w in result["warnings"]])
+            + "\n"
+        )
+    return output
+
+
+@kyo_tool
+async def refresh_okf_bundle() -> str:
+    """Re-read the catalogue's bundle (its OKF concept files) and report
+    what changed: files edited, added, or removed outside Kyo, files that
+    don't parse (their last indexed version is kept), and id conflicts.
+    Every tool already does this first; use this one to see the report."""
+    report = store.refresh()
+    output = (
+        f"Bundle: {report['bundle']}\n"
+        f"  Re-indexed: {report['indexed']}, removed: {report['removed']}, "
+        f"unchanged: {report['unchanged']}, written: {report['written']}\n"
+        f"  Broken links (tolerated): {report['broken_links']}\n"
+    )
+    for title, items in (
+        ("Errors", report["errors"]),
+        ("Warnings", report["warnings"]),
+    ):
+        if items:
+            output += (
+                f"  {title}:\n"
+                + "\n".join(f"  - {i['path']}: {i['message']}" for i in items)
+                + "\n"
+            )
+    return output
+
+
+@kyo_tool
+async def validate_okf_bundle(bundle_dir: str) -> str:
+    """Check a directory against the OKF v0.2 conformance rules (§11): every
+    concept file has YAML frontmatter with a non-empty `type`, and any
+    index.md / log.md follows §8 / §9. Warnings are soft guidance."""
+    try:
+        result = validate_bundle(bundle_dir)
+    except BundleError as e:
+        raise ToolError(str(e)) from e
+    verdict = "conformant" if result["conformant"] else "NOT conformant"
+    output = (
+        f"{bundle_dir}: {verdict} with OKF v{result['okf_version']} "
+        f"({result['concepts']} concept(s))\n"
+    )
+    if result["errors"]:
+        output += f"Errors:\n{_format_problems(result['errors'])}\n"
+    if result["warnings"]:
+        output += f"Warnings:\n{_format_problems(result['warnings'])}\n"
     return output
 
 

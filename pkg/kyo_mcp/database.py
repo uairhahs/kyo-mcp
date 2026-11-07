@@ -196,12 +196,26 @@ def initialize_db(db_path: Path) -> None:
     get_connection(db_path)
 
 
+# Where a concept's OKF bundle path is kept inside the metadata JSON column.
+# Stored there rather than in a column of its own so no schema migration is
+# needed: migration numbers are positional, and another branch already
+# claims v6. Prefixed so it can't collide with a producer's extension key.
+BUNDLE_PATH_KEY = "_kyo_bundle_path"
+# Also kept in the metadata JSON, for the bundle store (kyo_mcp/store.py):
+# the stamp of the file a row was indexed from, and that file's raw
+# `kyo_links` entries, from which the links table is rebuilt.
+FILE_STAMP_KEY = "_kyo_file"
+FILE_LINKS_KEY = "_kyo_links"
+
+
 class ConceptExistsError(ValueError):
     """Raised by create_concept(update_existing=False) on an id collision."""
 
 
 def _concept_row(
-    validated: OKFConcept, verified: List[Dict[str, Any]]
+    validated: OKFConcept,
+    verified: List[Dict[str, Any]],
+    internal: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     data = validated.model_dump(mode="json")
     resource = data.get("resource") or {}
@@ -211,6 +225,9 @@ def _concept_row(
         "verified": verified,
         "sources": data.get("sources") or [],
         "stale_after": data.get("stale_after"),
+        "ontology": data.get("ontology"),
+        BUNDLE_PATH_KEY: data.get("bundle_path"),
+        **(internal or {}),
     }
     return {
         "id": data["id"],
@@ -232,18 +249,29 @@ def create_concept(
     markdown_body: str = "",
     update_existing: bool = True,
     db_path: Optional[Path] = None,
+    merge_history: bool = True,
+    file_stamp: Optional[Dict[str, Any]] = None,
+    file_links: Optional[List[Any]] = None,
 ) -> None:
-    """Validate and persist a concept to the catalogue.
+    """Validate and persist a concept to the index.
+
+    This writes the SQLite index only. The bundle files are the source of
+    truth (kyo_mcp/store.py), so application code writes through
+    `store.save_concept` instead. A row written here without a
+    `file_stamp` has no file yet; the next `store.refresh` writes one.
 
     With update_existing=False, an existing id raises ConceptExistsError
     instead of being overwritten. With update_existing=True, an existing
     concept is replaced, but its verification history is kept: new
     `verified` entries are appended to the stored ones, not substituted.
+    Its bundle path is kept too, unless concept_dict gives a new one.
+    With merge_history=False (re-indexing a file, which is authoritative),
+    the stored history is replaced instead.
     """
     validated = OKFConcept.model_validate(concept_dict)
     if not validated.id:
         raise ValueError("Concept id is required")
-    new_verified = [v.model_dump() for v in validated.verified or []]
+    new_verified = [v.model_dump(exclude_none=True) for v in validated.verified or []]
     connection = get_connection(db_path)
 
     with _lock, connection:
@@ -253,11 +281,26 @@ def create_concept(
         if existing and not update_existing:
             raise ConceptExistsError(f"Concept {validated.id} already exists")
 
-        verified = (
-            _load_json(existing["metadata"]).get("verified", []) if existing else []
-        )
+        stored = _load_json(existing["metadata"]) if existing else {}
+        # Entries compare without None values, as documents write them.
+        verified = [
+            {k: v for k, v in entry.items() if v is not None}
+            for entry in (stored.get("verified", []) if merge_history else [])
+        ]
         verified += [v for v in new_verified if v not in verified]
-        row = _concept_row(validated, verified)
+        # Like verification history, the bundle path outlives a replace that
+        # doesn't name one, so the node keeps its file (and inbound links)
+        # on the next export. update_index_metadata changes or clears it.
+        if validated.bundle_path is None and stored.get(BUNDLE_PATH_KEY):
+            validated = validated.model_copy(
+                update={"bundle_path": stored[BUNDLE_PATH_KEY]}
+            )
+        internal = {}
+        if file_stamp is not None:
+            internal[FILE_STAMP_KEY] = file_stamp
+        if file_links is not None:
+            internal[FILE_LINKS_KEY] = file_links
+        row = _concept_row(validated, verified, internal)
         row["body_text"] = markdown_body
 
         if existing:
@@ -337,6 +380,10 @@ def _deserialize_concept(row: sqlite3.Row) -> Dict[str, Any]:
     row_dict["verified"] = metadata.pop("verified", [])
     row_dict["sources"] = metadata.pop("sources", [])
     row_dict["stale_after"] = metadata.pop("stale_after", None)
+    row_dict["ontology"] = metadata.pop("ontology", None)
+    row_dict["bundle_path"] = metadata.pop(BUNDLE_PATH_KEY, None)
+    row_dict["file_stamp"] = metadata.pop(FILE_STAMP_KEY, None)
+    row_dict["file_links"] = metadata.pop(FILE_LINKS_KEY, None)
     # What remains is OKFConcept.metadata: arbitrary extra keys, stored
     # alongside the trust fields above in the same JSON column.
     row_dict["metadata"] = metadata
@@ -354,13 +401,11 @@ def _deserialize_concept(row: sqlite3.Row) -> Dict[str, Any]:
 # strict AND match only has to cover the words that actually carry
 # meaning; _fts_terms below still falls back further, to an OR match,
 # when even that comes up empty.
-_STOPWORDS = frozenset(
-    """
+_STOPWORDS = frozenset("""
     a an the is are was were be been being do does did what which who
     whom this that these those of in on at to for and or but with about
     from as it its we you i me my our us
-    """.split()
-)
+    """.split())
 
 
 def _fts_terms(search_term: str) -> List[str]:
@@ -444,8 +489,13 @@ def get_concept_by_id(
 def update_node_verified(
     node_id: str, new_verified_actor: dict, db_path: Optional[Path] = None
 ) -> bool:
-    """Record a human verification event. `by` may be given bare ("alice")
-    or already prefixed ("human:alice"); either is stored as "human:alice"."""
+    """Record a human verification event in the index. `by` may be given
+    bare ("alice") or already prefixed ("human:alice"); either is stored as
+    "human:alice".
+
+    Index only: application code uses `store.verify_concept`, which writes
+    the file. This clears the row's file stamp, so the next `store.refresh`
+    writes the change to the file instead of the two disagreeing."""
     conn = get_connection(db_path)
     with _lock, conn:
         row = conn.execute(
@@ -462,6 +512,7 @@ def update_node_verified(
         if new_entry not in verified_list:
             verified_list.append(new_entry)
         meta["verified"] = verified_list
+        meta.pop(FILE_STAMP_KEY, None)
 
         conn.execute(
             "UPDATE knowledge_concepts SET metadata = ? WHERE id = ?",
@@ -658,3 +709,67 @@ def get_all_links(db_path: Optional[Path] = None) -> List[Dict[str, Any]]:
         "SELECT source_id, target_id, relation_type FROM knowledge_links"
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def update_index_metadata(
+    concept_id: str, values: Dict[str, Any], db_path: Optional[Path] = None
+) -> None:
+    """Set (or, with None, remove) internal keys in a row's metadata JSON
+    without touching its content or updated_at."""
+    conn = get_connection(db_path)
+    with _lock, conn:
+        row = conn.execute(
+            "SELECT metadata FROM knowledge_concepts WHERE id = ?", (concept_id,)
+        ).fetchone()
+        if row is None:
+            return
+        metadata = _load_json(row["metadata"])
+        for key, value in values.items():
+            if value is None:
+                metadata.pop(key, None)
+            else:
+                metadata[key] = value
+        conn.execute(
+            "UPDATE knowledge_concepts SET metadata = ? WHERE id = ?",
+            (json.dumps(metadata), concept_id),
+        )
+
+
+def touch_concept(concept_id: str, db_path: Optional[Path] = None) -> bool:
+    """Mark a concept recently used by bumping updated_at, content unchanged.
+    Index only: recency is catalogue state, not part of the concept."""
+    conn = get_connection(db_path)
+    with _lock, conn:
+        return (
+            conn.execute(
+                "UPDATE knowledge_concepts SET updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ?",
+                (concept_id,),
+            ).rowcount
+            > 0
+        )
+
+
+def find_concept_by_bundle_path(
+    bundle_path: str, db_path: Optional[Path] = None
+) -> Optional[Dict[str, Any]]:
+    """The concept last exported to, or imported from, `bundle_path`."""
+    row = (
+        get_connection(db_path)
+        .execute(
+            "SELECT * FROM knowledge_concepts "
+            "WHERE json_extract(metadata, ?) = ? LIMIT 1",
+            (f"$.{BUNDLE_PATH_KEY}", bundle_path),
+        )
+        .fetchone()
+    )
+    return _deserialize_concept(row) if row else None
+
+
+def delete_outgoing_links(source_id: str, db_path: Optional[Path] = None) -> int:
+    """Delete every link whose source is `source_id`. Returns how many."""
+    conn = get_connection(db_path)
+    with _lock, conn:
+        return conn.execute(
+            "DELETE FROM knowledge_links WHERE source_id = ?", (source_id,)
+        ).rowcount

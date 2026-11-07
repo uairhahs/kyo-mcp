@@ -21,10 +21,10 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 import httpx
+from kyo_mcp import store
 from kyo_mcp.common import GENERATOR, now_iso
 from kyo_mcp.database import (
     clear_hindsight_operation,
-    create_concept,
     fail_hindsight_operation,
     get_concept_by_id,
     get_failed_hindsight_operation,
@@ -34,7 +34,7 @@ from kyo_mcp.database import (
     query_catalog,
     set_hindsight_operation,
     set_sync_hash,
-    update_concept,
+    touch_concept,
 )
 from kyo_mcp.okf_schema import (
     OKFConcept,
@@ -95,6 +95,7 @@ def reflect_timeout() -> float:
         )
         return DEFAULT_REFLECT_TIMEOUT
     return value
+
 
 # Cap on concurrent Hindsight requests during a bulk sync. Retains are
 # submitted with async=true, so each request only enqueues work; the cap
@@ -488,7 +489,7 @@ class BridgeLayer:
         A recalled memory carrying an `okf_id` in its metadata (set by
         sync_concept_to_hindsight) maps back to the kyo node it was
         synced from. If that node still exists locally, it is "touched"
-        -- its updated_at is bumped via an empty update_concept call,
+        -- its updated_at is bumped via touch_concept (index only),
         with content left untouched -- so it re-enters the actively-used
         working set instead of only existing as one-off recalled text.
         Memories with no resolvable okf_id (native Hindsight memories, or
@@ -516,7 +517,7 @@ class BridgeLayer:
             okf_id = metadata.get("okf_id") or result.get("document_id")
 
             if okf_id and get_concept_by_id(okf_id, db_path=self.db_path):
-                update_concept(okf_id, {}, db_path=self.db_path)
+                touch_concept(okf_id, db_path=self.db_path)
                 stats["touched"] += 1
                 continue
 
@@ -527,7 +528,7 @@ class BridgeLayer:
             # memory id, deterministic new_id): touch it rather than
             # recreating it, same as the okf_id branch above.
             if get_concept_by_id(new_id, db_path=self.db_path):
-                update_concept(new_id, {}, db_path=self.db_path)
+                touch_concept(new_id, db_path=self.db_path)
                 stats["touched"] += 1
                 continue
 
@@ -544,7 +545,7 @@ class BridgeLayer:
                     {"id": result.get("id") or new_id, "resource": "hindsight"}
                 ],
             }
-            create_concept(concept_dict, markdown_body=text, db_path=self.db_path)
+            store.save_concept(concept_dict, text, db_path=self.db_path)
             stats["created"] += 1
 
         return stats

@@ -6,9 +6,17 @@ importing the MCP SDK alone (via mcp_server) used to cost it ~0.65s.
 
 import datetime
 import uuid
+from importlib.metadata import PackageNotFoundError, version
 from typing import Optional
 
-GENERATOR = "process:kyo-mcp"
+try:
+    _VERSION = version("kyo-mcp")
+except PackageNotFoundError:  # running from a source tree without install
+    _VERSION = "0.0.0"
+
+# The actor stamped into `generated.by`. OKF §7: agents and tools use
+# `<producer>/<version>`; `process:<id>` is reserved for automated processes.
+GENERATOR = f"kyo-mcp/{_VERSION}"
 
 
 def now_iso() -> str:
