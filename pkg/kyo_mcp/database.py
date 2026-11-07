@@ -511,10 +511,10 @@ _STOPWORDS = frozenset("""
 
 
 def _fts_terms(search_term: str) -> List[str]:
-    """Split free text into search terms, dropping stopwords -- unless
-    that would leave nothing to search for, in which case the original
-    words are kept so the query still runs (and legitimately finds
-    nothing) rather than silently searching for an empty string."""
+    """Split free text into search terms, dropping stopwords, unless
+    that would leave nothing to search for. Then the original words are
+    kept, so the query still runs (and legitimately finds nothing) rather
+    than silently searching for an empty string."""
     words = search_term.split()
     filtered = [w for w in words if w.lower() not in _STOPWORDS]
     return filtered or words

@@ -165,7 +165,7 @@ def test_query_catalog_falls_back_to_or_when_and_finds_nothing():
     )
 
     # No node contains all of "what", "concepts", "teardown",
-    # "calibration" -- stopwords ("what") are dropped, and the remaining
+    # "calibration". Stopwords ("what") are dropped, and the remaining
     # AND match on "concepts teardown calibration" still finds nothing (no
     # node has "concepts"), so this must fall back to an OR match.
     results = query_catalog(search_term="what concepts teardown calibration")

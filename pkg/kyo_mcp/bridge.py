@@ -562,10 +562,10 @@ class BridgeLayer:
 
         A recalled memory carrying an `okf_id` in its metadata (set by
         sync_concept_to_hindsight) maps back to the kyo node it was
-        synced from. If that node still exists locally, it is "touched"
-        -- its updated_at is bumped via touch_concept (index only),
-        with content left untouched -- so it re-enters the actively-used
-        working set instead of only existing as one-off recalled text.
+        synced from. If that node still exists locally, it is "touched":
+        its updated_at is bumped via touch_concept (index only), with
+        content left untouched, so it re-enters the actively-used working
+        set instead of only existing as one-off recalled text.
         Memories with no resolvable okf_id (native Hindsight memories, or
         ones synced before this provenance tracking existed) are
         materialized as new concepts instead, deterministically id'd from

@@ -6,8 +6,8 @@ RecallResponse/RecallResult, ReflectResponse, ConsolidationResponse), not
 guessed or copied from older test fixtures. That distinction matters: an
 earlier ad-hoc mock shape (`{"observations": [...]}` for a reflect
 response) let bridge.py and mcp_server.py's trigger_reflection code drift
-from the real API -- the real ReflectResponse has only ever had a `text`
-field -- without any test ever catching it, because the mock was never
+from the real API (the real ReflectResponse has only ever had a `text`
+field) without any test ever catching it, because the mock was never
 checked against the schema it was standing in for. Every test that mocks
 a Hindsight HTTP response should build it from here instead of writing an
 inline dict, so that drift can't happen silently again.
