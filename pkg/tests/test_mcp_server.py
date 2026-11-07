@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import tests.hindsight_fixtures as hindsight
 from kyo_mcp.bridge import BridgeLayer
+from kyo_mcp.common import GENERATOR
 from kyo_mcp.database import get_concept_by_id
 from kyo_mcp.mcp_server import (
     create_kyo_node,
@@ -71,7 +72,7 @@ class TestCreateKyoNode:
     async def test_stale_after_is_persisted(self):
         """Regression: stale_after used to be silently dropped on save."""
         node_id = await make_node("Fresh Until", stale_after="2030-01-01")
-        assert get_concept_by_id(node_id)["stale_after"] == "2030-01-01"
+        assert get_concept_by_id(node_id)["stale_after"] == "2030-01-01T00:00:00Z"
 
     @pytest.mark.asyncio
     async def test_ids_are_unique_across_processes(self):
@@ -90,8 +91,8 @@ class TestGetKyoNode:
         node_id = await make_node("Doc Node", tags=["a"], stale_after="2030-01-01")
         md = await get_kyo_node(node_id)
         assert md.startswith("---\ntype: concept\n")
-        assert "stale_after: '2030-01-01'" in md
-        assert "process:kyo-mcp" in md
+        assert "stale_after: '2030-01-01T00:00:00Z'" in md
+        assert f"by: {GENERATOR}" in md
 
     @pytest.mark.asyncio
     async def test_markdown_lists_links(self):

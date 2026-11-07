@@ -82,7 +82,8 @@ async def create_kyo_node(
     """Create a new knowledge node in the Kyo Knowledge Catalogue (OKF v0.2).
 
     Implements Trust Signals: `generated` (always), and optional `sources`.
-    Implements Freshness: `stale_after` (ISO 8601 date or timestamp).
+    Implements Freshness: `stale_after` (ISO 8601 timestamp; a bare date
+    is stored as midnight UTC, per OKF §5).
     `body` is the node's markdown body; a minimal one is generated from the
     title and description when omitted.
     """

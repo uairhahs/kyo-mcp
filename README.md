@@ -78,7 +78,8 @@ kyo/
 │   ├── pyproject.toml
 │   └── README.md
 ├── docs/
-│   └── OKF.md             # OKF v0.2 specification
+│   ├── OKF.md             # OKF overview (reference agent README)
+│   └── SPEC.md            # OKF v0.2 specification, vendored from upstream
 ├── README.md
 └── .codebase-memory/      # Codebase knowledge graph config
 ```

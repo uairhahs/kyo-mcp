@@ -211,6 +211,7 @@ def _concept_row(
         "verified": verified,
         "sources": data.get("sources") or [],
         "stale_after": data.get("stale_after"),
+        "ontology": data.get("ontology"),
     }
     return {
         "id": data["id"],
@@ -337,6 +338,7 @@ def _deserialize_concept(row: sqlite3.Row) -> Dict[str, Any]:
     row_dict["verified"] = metadata.pop("verified", [])
     row_dict["sources"] = metadata.pop("sources", [])
     row_dict["stale_after"] = metadata.pop("stale_after", None)
+    row_dict["ontology"] = metadata.pop("ontology", None)
     # What remains is OKFConcept.metadata: arbitrary extra keys, stored
     # alongside the trust fields above in the same JSON column.
     row_dict["metadata"] = metadata
