@@ -30,13 +30,9 @@ import json
 import sys
 from typing import Any
 
+from kyo_mcp import store
 from kyo_mcp.common import GENERATOR, new_node_id, now_iso
-from kyo_mcp.database import (
-    create_concept,
-    create_link,
-    get_concept_by_id,
-    query_catalog,
-)
+from kyo_mcp.database import get_concept_by_id, query_catalog
 from kyo_mcp.okf_schema import OKFConcept
 
 
@@ -89,8 +85,12 @@ def cmd_create_concept(args: argparse.Namespace) -> Any:
         "sources": [{"id": "kyo-cli", "resource": "kyo-cli"}],
     }
     body = args.content or f"# {args.label}\n\n{args.summary}\n"
-    create_concept(concept_dict, markdown_body=body, update_existing=False)
-    return {"created": True, "concept_id": concept_dict["id"]}
+    saved = store.save_concept(concept_dict, body, create=True)
+    return {
+        "created": True,
+        "concept_id": concept_dict["id"],
+        "file": str(store.concept_file(saved["bundle_path"])),
+    }
 
 
 def cmd_create_link(args: argparse.Namespace) -> Any:
@@ -98,7 +98,7 @@ def cmd_create_link(args: argparse.Namespace) -> Any:
     missing = [i for i in (args.source_id, args.target_id) if not get_concept_by_id(i)]
     if missing:
         raise CommandError(f"Concept(s) not found: {', '.join(missing)}")
-    create_link(args.source_id, args.target_id, args.link_type)
+    store.add_link(args.source_id, args.target_id, args.link_type)
     return {
         "created": True,
         "source_id": args.source_id,
@@ -174,6 +174,11 @@ async def cmd_trigger_reflection(args: argparse.Namespace) -> Any:
     if bridge.last_error:
         raise CommandError(bridge.last_error)
     return {"query": query, "result": result}
+
+
+def cmd_refresh(args: argparse.Namespace) -> Any:
+    """Re-read the bundle and report what changed."""
+    return store.refresh()
 
 
 def cmd_export_bundle(args: argparse.Namespace) -> Any:
@@ -257,6 +262,10 @@ def build_parser() -> argparse.ArgumentParser:
         func=cmd_trigger_consolidation
     )
 
+    subparsers.add_parser(
+        "refresh", help="Re-read the bundle (the store) and report changes"
+    ).set_defaults(func=cmd_refresh)
+
     p = subparsers.add_parser("export_bundle", help="Export as an OKF v0.2 bundle")
     p.add_argument("out_dir")
     p.add_argument(
@@ -288,6 +297,9 @@ def build_parser() -> argparse.ArgumentParser:
 async def run(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        # The bundle is the source of truth: see edits made to it directly.
+        if args.func is not cmd_validate_bundle:
+            store.refresh()
         result = args.func(args)
         if inspect.isawaitable(result):
             result = await result

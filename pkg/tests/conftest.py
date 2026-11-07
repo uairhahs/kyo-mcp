@@ -18,6 +18,9 @@ def setup_test_env(tmp_path, monkeypatch):
     db_mod.close_connections()
     monkeypatch.setattr(db_mod, "DB_PATH", None)
     monkeypatch.delenv("KYO_DATA_DIR", raising=False)
+    # The store's bundle defaults to tmp_path/bundle, next to the test db;
+    # never let a real KYO_BUNDLE_DIR leak into a test.
+    monkeypatch.delenv("KYO_BUNDLE_DIR", raising=False)
     monkeypatch.setenv("KYO_DB_PATH", str(tmp_path / "test_kyo_catalog.db"))
     yield tmp_path
     db_mod.close_connections()

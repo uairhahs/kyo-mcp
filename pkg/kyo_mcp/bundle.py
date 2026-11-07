@@ -1,178 +1,44 @@
-"""OKF v0.2 bundles: export the catalogue as a bundle, import a bundle into
-it, and check a bundle against the conformance rules.
+"""OKF v0.2 bundle tools: export the store as a standalone bundle, import a
+bundle into the store, and check a bundle against the conformance rules.
 
-Section references (§) are to docs/SPEC.md. A bundle is a directory of
-markdown concept documents (§3); a concept's id is its path in the bundle
-minus `.md` (§2); concepts link with standard markdown links (§6.1); and
-`index.md` / `log.md` are reserved (§3.1, §8, §9).
-
-Kyo's typed links have no OKF equivalent: OKF links are untyped, with the
-relationship given by the surrounding prose (§6.1). They travel as a
-`kyo_links` extension key (§4.1) and, so that plain OKF consumers still see
-the edge, as an ordinary markdown link in a generated section delimited by
-LINKS_START / LINKS_END, using relative links (see relative_link). Import
-strips that section again.
+Section references (§) are to docs/SPEC.md. Kyo's store is itself a bundle
+(kyo_mcp/store.py), so both export and import copy concept files byte for
+byte: an imported file keeps its formatting until Kyo itself changes it.
+Export adds an `index.md` per directory (§8) for progressive disclosure.
 """
 
 import datetime
 import json
 import posixpath
 import re
-import unicodedata
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
-from urllib.parse import unquote
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import yaml
-from kyo_mcp.common import GENERATOR, new_node_id
-from kyo_mcp.database import (
-    create_concept,
-    create_link,
-    delete_outgoing_links,
-    find_concept_by_bundle_path,
-    get_all_links,
-    get_concept_by_id,
-    query_catalog,
-    set_bundle_path,
+from kyo_mcp import database as db
+from kyo_mcp import store
+from kyo_mcp.bundle_format import (
+    OKF_VERSION,
+    RESERVED_FILENAMES,
+    body_link_targets,
+    concept_files,
+    is_valid_kyo_id,
+    link_label,
+    one_line,
+    path_derived_id,
+    resolve_link,
 )
+from kyo_mcp.common import GENERATOR
 from kyo_mcp.okf_schema import OKFConcept, parse_frontmatter, render_document
 
-OKF_VERSION = "0.2"
-RESERVED_FILENAMES = frozenset({"index.md", "log.md"})  # §3.1
-KYO_LINKS_KEY = "kyo_links"
-DEFAULT_RELATION = "references"
-LINKS_START = "<!-- kyo:links -->"
-LINKS_END = "<!-- /kyo:links -->"
 EXPORT_MANIFEST = ".kyo-export.json"
 
-# Export appends "\n" + the block to a body ending in "\n"; removing exactly
-# that restores the original body.
-_LINKS_BLOCK = re.compile(
-    r"\n" + re.escape(LINKS_START) + r"\n.*?\n" + re.escape(LINKS_END) + r"\n",
-    re.DOTALL,
-)
-_FENCED_CODE = re.compile(r"^(```|~~~).*?^\1[^\n]*$", re.DOTALL | re.MULTILINE)
-_INLINE_CODE = re.compile(r"`[^`\n]*`")
-# [text](href) or [text](href "title"), but not an image ![alt](src).
-_MARKDOWN_LINK = re.compile(
-    r"(?<!!)\[(?:[^\]\\\n]|\\.)*\]\(\s*<?([^)\s>]+)>?(?:\s+(?:\"[^\"]*\"|'[^']*'))?\s*\)"
-)
-_URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 _LOG_DATE_HEADING = re.compile(r"^## (\d{4}-\d{2}-\d{2})\s*$")
 
 
 class BundleError(ValueError):
-    """A bundle operation that can't proceed, such as exporting over
-    files Kyo didn't write."""
-
-
-# --- Paths and links ---------------------------------------------------------
-
-
-def slugify(text: str) -> str:
-    """A lowercase, filesystem-safe path segment ("" if nothing survives)."""
-    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
-    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:80].strip("-")
-
-
-def is_valid_bundle_path(path: Optional[str]) -> bool:
-    """A concept id (§2): relative, no `..`, no `.md`, not a reserved name."""
-    if not path or path.startswith("/") or path.endswith(".md"):
-        return False
-    parts = path.split("/")
-    if any(part in ("", ".", "..") or part.startswith(".") for part in parts):
-        return False
-    return f"{parts[-1]}.md" not in RESERVED_FILENAMES
-
-
-def _derived_path(concept: Dict[str, Any]) -> str:
-    folder = slugify(concept.get("type") or "") or "concepts"
-    name = slugify(concept.get("title") or "") or slugify(concept["id"])
-    return f"{folder}/{name or 'concept'}"
-
-
-def assign_bundle_paths(concepts: Iterable[Dict[str, Any]]) -> Dict[str, str]:
-    """Map concept id -> bundle path. A concept keeps the path it was last
-    exported to or imported from, so links into the bundle stay stable;
-    new concepts get `<type>/<title>`, disambiguated with the id on a
-    collision or a reserved name."""
-    concepts = list(concepts)
-    taken: Set[str] = set()
-    paths: Dict[str, str] = {}
-    # Stored paths first, so a new concept can't take an existing one's.
-    for concept in concepts:
-        path = concept.get("bundle_path")
-        if is_valid_bundle_path(path) and path not in taken:
-            paths[concept["id"]] = path
-            taken.add(path)
-    for concept in concepts:
-        if concept["id"] in paths:
-            continue
-        path = _derived_path(concept)
-        if path in taken or not is_valid_bundle_path(path):
-            path = f"{path}-{slugify(concept['id'])[-12:]}"
-        suffix = 2
-        base = path
-        while path in taken:
-            path = f"{base}-{suffix}"
-            suffix += 1
-        paths[concept["id"]] = path
-        taken.add(path)
-    return paths
-
-
-def strip_links_block(body: str) -> str:
-    """Remove the links section Kyo generates on export."""
-    return _LINKS_BLOCK.sub("", body)
-
-
-def append_links_block(body: str, entries: List[str]) -> str:
-    """Append Kyo's generated links section. A body without a trailing
-    newline gets one, so strip_links_block can undo this exactly."""
-    if not body.endswith("\n"):
-        body += "\n"
-    lines = "\n".join(entries)
-    return f"{body}\n{LINKS_START}\n## Links\n\n{lines}\n{LINKS_END}\n"
-
-
-def body_link_targets(body: str) -> List[str]:
-    """Every markdown link target in a body, ignoring code."""
-    text = _INLINE_CODE.sub("", _FENCED_CODE.sub("", body))
-    return [m.group(1) for m in _MARKDOWN_LINK.finditer(text)]
-
-
-def resolve_link(href: str, from_path: str) -> Optional[str]:
-    """The concept id an in-bundle link points at (§6.1), or None for an
-    external link, a non-concept target, or one that leaves the bundle."""
-    href = unquote(href.split("#", 1)[0].split("?", 1)[0])
-    if not href or _URL_SCHEME.match(href) or not href.endswith(".md"):
-        return None
-    if href.startswith("/"):
-        target = posixpath.normpath(href.lstrip("/"))
-    else:
-        target = posixpath.normpath(posixpath.join(posixpath.dirname(from_path), href))
-    if target.startswith("..") or target in (".", ""):
-        return None
-    return target[: -len(".md")]
-
-
-def relative_link(target_path: str, from_path: str) -> str:
-    """A relative markdown link (§6.1) from one concept to another. The
-    spec recommends the absolute `/...` form, but Google's reference
-    viewer ignores absolute links (okf/src/reference_agent/viewer/
-    generator.py, `_extract_links`), so the relative form reaches more
-    consumers. Both resolve to the same concept."""
-    start = posixpath.dirname(from_path) or "."
-    href = posixpath.relpath(f"{target_path}.md", start)
-    return href if href.startswith("../") else f"./{href}"
-
-
-def _link_label(text: str) -> str:
-    return re.sub(r"([\[\]\\])", r"\\\1", " ".join(text.split()))
-
-
-def _one_line(text: Optional[str]) -> str:
-    return " ".join((text or "").split())
+    """A bundle operation that can't proceed, such as exporting over files
+    Kyo didn't write."""
 
 
 # --- Export ------------------------------------------------------------------
@@ -206,15 +72,15 @@ def _index_document(
         for path, concept in sorted(
             concepts, key=lambda c: ((c[1].get("title") or c[0]).lower(), c[0])
         ):
-            label = _link_label(concept.get("title") or posixpath.basename(path))
+            label = link_label(concept.get("title") or posixpath.basename(path))
             entry = f"* [{label}]({posixpath.basename(path)}.md)"
-            description = _one_line(concept.get("description"))
+            description = one_line(concept.get("description"))
             lines.append(f"{entry} - {description}" if description else entry)
         lines.append("")
     if subdirs:
         lines += ["# Directories", ""]
         for subdir in sorted(subdirs):
-            lines.append(f"* [{_link_label(subdir)}]({subdir}/)")
+            lines.append(f"* [{link_label(subdir)}]({subdir}/)")
         lines.append("")
     body = "\n".join(lines)
     if directory == "":
@@ -226,14 +92,21 @@ def _index_document(
 def export_bundle(
     out_dir: str, overwrite: bool = False, db_path: Optional[Path] = None
 ) -> Dict[str, Any]:
-    """Write the whole catalogue to `out_dir` as an OKF v0.2 bundle.
+    """Write a standalone copy of the store to `out_dir`, with an index.md
+    in every directory (§8).
 
     `out_dir` must be missing or empty, unless it holds a previous Kyo
     export and `overwrite` is set: then only the files that export wrote
-    are replaced. Each concept keeps its bundle path across exports.
-    Returns counts plus the bundle's validation result.
+    are replaced. Output is deterministic, so an unchanged catalogue
+    exports to identical files. Returns counts plus the validation result.
     """
     out = Path(out_dir).expanduser()
+    source = store.bundle_dir(db_path)
+    resolved = out.resolve()
+    if resolved == source or source in resolved.parents or resolved in source.parents:
+        raise BundleError(
+            f"{out} overlaps the store ({source}); choose another directory"
+        )
     if out.exists() and not out.is_dir():
         raise BundleError(f"{out} exists and is not a directory")
     if out.exists() and any(out.iterdir()):
@@ -249,66 +122,25 @@ def export_bundle(
         _clear_previous_export(out)
     out.mkdir(parents=True, exist_ok=True)
 
-    concepts = query_catalog(db_path=db_path)
-    by_id = {concept["id"]: concept for concept in concepts}
-    paths = assign_bundle_paths(concepts)
-    assigned = 0
-    for concept in concepts:
-        if concept.get("bundle_path") != paths[concept["id"]]:
-            set_bundle_path(concept["id"], paths[concept["id"]], db_path=db_path)
-            assigned += 1
-
-    outgoing: Dict[str, List[Dict[str, Any]]] = {}
-    for link in get_all_links(db_path=db_path):
-        if link["source_id"] in paths and link["target_id"] in paths:
-            outgoing.setdefault(link["source_id"], []).append(link)
-
+    store.refresh(db_path)
+    rows = {
+        r["bundle_path"]: r
+        for r in db.query_catalog(db_path=db_path)
+        if r.get("bundle_path")
+    }
     written: List[str] = []
     by_dir: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
-    typed_links = 0
-    for concept in concepts:
-        path = paths[concept["id"]]
-        model = OKFConcept.model_validate(concept)
-        body = strip_links_block(concept.get("body_text") or "") or model.default_body()
-        inline = {resolve_link(href, path) for href in body_link_targets(body)}
-
-        kyo_links: List[Dict[str, str]] = []
-        block: List[str] = []
-        for link in sorted(
-            outgoing.get(concept["id"], []),
-            key=lambda link: (paths[link["target_id"]], link["relation_type"]),
-        ):
-            target_path = paths[link["target_id"]]
-            linked_inline = target_path in inline
-            if linked_inline and link["relation_type"] == DEFAULT_RELATION:
-                continue  # the body's own link already says it (§6.1)
-            target = f"/{target_path}.md"
-            kyo_links.append({"rel": link["relation_type"], "target": target})
-            if not linked_inline:
-                label = _link_label(
-                    by_id[link["target_id"]].get("title") or target_path
-                )
-                href = relative_link(target_path, path)
-                block.append(f"- {link['relation_type']}: [{label}]({href})")
-                inline.add(target_path)
-        typed_links += len(kyo_links)
-
-        frontmatter = model.to_frontmatter()
-        frontmatter.pop(KYO_LINKS_KEY, None)
-        if kyo_links:
-            frontmatter[KYO_LINKS_KEY] = kyo_links
-        if block:
-            body = append_links_block(body, block)
-
-        file = out / f"{path}.md"
-        file.parent.mkdir(parents=True, exist_ok=True)
-        file.write_text(render_document(frontmatter, body), encoding="utf-8")
+    for file, path in concept_files(source):
+        if path not in rows:
+            continue  # failed to parse, so not part of the catalogue
+        target = out / f"{path}.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(file.read_bytes())
         written.append(f"{path}.md")
-        by_dir.setdefault(posixpath.dirname(path), []).append((path, concept))
+        by_dir.setdefault(posixpath.dirname(path), []).append((path, rows[path]))
 
-    # Every directory on the way to a concept gets an index.md (§8).
     directories: Set[str] = {""}
-    for path in paths.values():
+    for path in written:
         parent = posixpath.dirname(path)
         while parent:
             directories.add(parent)
@@ -343,10 +175,8 @@ def export_bundle(
     )
     return {
         "bundle": str(out),
-        "concepts": len(concepts),
+        "concepts": sum(len(v) for v in by_dir.values()),
         "index_files": len(directories),
-        "typed_links": typed_links,
-        "paths_assigned": assigned,
         "validation": validate_bundle(str(out)),
     }
 
@@ -354,117 +184,96 @@ def export_bundle(
 # --- Import ------------------------------------------------------------------
 
 
-def _concept_files(root: Path) -> Iterable[Tuple[Path, str]]:
-    """(file, concept id) for every concept document, skipping reserved
-    files (§3.1) and hidden directories such as .git."""
-    for file in sorted(root.rglob("*.md")):
-        rel = file.relative_to(root)
-        if any(part.startswith(".") for part in rel.parts):
-            continue
-        if file.name in RESERVED_FILENAMES:
-            continue
-        yield file, rel.with_suffix("").as_posix()
-
-
 def import_bundle(bundle_dir: str, db_path: Optional[Path] = None) -> Dict[str, Any]:
-    """Load an OKF bundle into the catalogue.
+    """Copy an OKF bundle's concept files into the store, byte for byte, at
+    the same paths, then index them.
 
-    A concept is matched to an existing node by its `kyo_id`, then by the
-    bundle path it was last exported to or imported from; otherwise a new
-    node is created. Markdown links between concepts become `references`
-    links, and `kyo_links` entries become typed links. As a consumer must
-    (§11), the import tolerates unknown types and keys, missing index
-    files, and broken links. A file that isn't a concept document is
-    skipped and reported rather than failing the whole import.
+    A file is the same concept as one already in the store if it has the
+    same id: its `kyo_id`, else the id derived from its path. Such a file
+    replaces the stored one. A file whose path holds a different concept,
+    or whose `kyo_id` is used at another path, is skipped and reported, as
+    is a file that isn't a concept document. As a consumer must (§11),
+    unknown types and keys, missing index files, and broken links are
+    accepted. `index.md` and `log.md` aren't concepts and aren't copied.
     """
     root = Path(bundle_dir).expanduser()
     if not root.is_dir():
         raise BundleError(f"{root} is not a directory")
+    target_root = store.bundle_dir(db_path)
 
-    imported: List[Tuple[str, str, OKFConcept, str]] = []  # (id, path, concept, body)
+    store.refresh(db_path)
+    by_path = {
+        r["bundle_path"]: r
+        for r in db.query_catalog(db_path=db_path)
+        if r.get("bundle_path")
+    }
+    path_of = {r["id"]: p for p, r in by_path.items()}
+
+    created = updated = unchanged = 0
     skipped: List[Dict[str, str]] = []
-    created = updated = 0
-    for file, path in _concept_files(root):
+    imported: List[str] = []
+    for file, path in concept_files(root):
+        data = file.read_bytes()
         try:
-            concept, body = OKFConcept.from_markdown(file.read_text(encoding="utf-8"))
-        except Exception as e:  # noqa: BLE001 - reported per file, see docstring
+            concept, _ = OKFConcept.from_markdown(data.decode("utf-8"))
+        except Exception as e:  # noqa: BLE001 - reported per file
             skipped.append({"path": f"{path}.md", "reason": str(e).splitlines()[0]})
             continue
-        # A kyo_id is the node's identity; without one, the bundle path is.
-        if concept.id:
-            existing = get_concept_by_id(concept.id, db_path=db_path)
-        else:
-            existing = find_concept_by_bundle_path(path, db_path=db_path)
-        node_id = concept.id or (existing["id"] if existing else new_node_id())
-        concept.id = node_id
-        concept.bundle_path = path
-        body = strip_links_block(body)
-        imported.append((node_id, path, concept, body))
-        created += not existing
-        updated += bool(existing)
-
-    # Write every concept before any link, so link targets exist.
-    ids_by_path = {path: node_id for node_id, path, _, _ in imported}
-    for _, _, concept, body in imported:
-        stored = concept.model_copy(
-            update={
-                "metadata": {
-                    k: v for k, v in concept.metadata.items() if k != KYO_LINKS_KEY
+        node_id = concept.id if is_valid_kyo_id(concept.id) else path_derived_id(path)
+        occupant = by_path.get(path)
+        if occupant and occupant["id"] != node_id:
+            skipped.append(
+                {
+                    "path": f"{path}.md",
+                    "reason": "the store already has a different concept "
+                    f"({occupant['id']}) at this path",
                 }
-            }
-        )
-        create_concept(
-            stored.model_dump(mode="python"),
-            body,
-            update_existing=True,
-            db_path=db_path,
-        )
-
-    def target_id(path: Optional[str]) -> Optional[str]:
-        if path is None:
-            return None
-        if path in ids_by_path:
-            return ids_by_path[path]
-        found = find_concept_by_bundle_path(path, db_path=db_path)
-        return found["id"] if found else None
-
-    inline_links = typed_links = 0
-    broken: List[Dict[str, str]] = []
-    for node_id, path, concept, body in imported:
-        # The file is the source of truth for its concept's links.
-        delete_outgoing_links(node_id, db_path=db_path)
-        for href in body_link_targets(body):
-            target = resolve_link(href, path)
-            if target is None:
-                continue  # external or non-concept link
-            tid = target_id(target)
-            if tid is None:
-                broken.append({"from": f"{path}.md", "to": href})
-                continue
-            create_link(node_id, tid, DEFAULT_RELATION, db_path=db_path)
-            inline_links += 1
-        entries = concept.metadata.get(KYO_LINKS_KEY) or []
-        for entry in entries if isinstance(entries, list) else []:
-            if not isinstance(entry, dict) or not entry.get("target"):
-                continue
-            tid = target_id(resolve_link(str(entry["target"]), path))
-            if tid is None:
-                broken.append({"from": f"{path}.md", "to": str(entry["target"])})
-                continue
-            create_link(
-                node_id, tid, str(entry.get("rel") or DEFAULT_RELATION), db_path=db_path
             )
-            typed_links += 1
+            continue
+        if path_of.get(node_id, path) != path:
+            skipped.append(
+                {
+                    "path": f"{path}.md",
+                    "reason": f"{node_id} is already in the store at "
+                    f"{path_of[node_id]}.md",
+                }
+            )
+            continue
+        dest = target_root / f"{path}.md"
+        if dest.exists() and dest.read_bytes() == data:
+            unchanged += 1
+        else:
+            store.write_file(dest, data)
+            if occupant:
+                updated += 1
+            else:
+                created += 1
+        path_of[node_id] = path
+        imported.append(path)
 
+    report = store.refresh(db_path)
+    indexed = {
+        r["bundle_path"]
+        for r in db.query_catalog(db_path=db_path)
+        if r.get("bundle_path")
+    }
+    broken = []
+    for path in imported:
+        row = db.find_concept_by_bundle_path(path, db_path=db_path)
+        for href in body_link_targets((row or {}).get("body_text") or ""):
+            target = resolve_link(href, path)
+            if target is not None and target not in indexed:
+                broken.append({"from": f"{path}.md", "to": href})
     return {
         "bundle": str(root),
+        "store": str(target_root),
         "concepts": len(imported),
         "created": created,
         "updated": updated,
-        "inline_links": inline_links,
-        "typed_links": typed_links,
+        "unchanged": unchanged,
         "broken_links": broken,
         "skipped": skipped,
+        "warnings": report["warnings"],
     }
 
 
@@ -473,6 +282,55 @@ def import_bundle(bundle_dir: str, db_path: Optional[Path] = None) -> Dict[str, 
 
 def _problem(path: str, rule: str, message: str) -> Dict[str, str]:
     return {"path": path, "rule": rule, "message": message}
+
+
+def _check_index(name: str, at_root: bool, frontmatter: Any, body: str, out) -> None:
+    errors, warnings = out
+    if frontmatter is not None:
+        extra = (
+            set(frontmatter) - {"okf_version"}
+            if isinstance(frontmatter, dict)
+            else {"?"}
+        )
+        if not at_root:
+            errors.append(
+                _problem(
+                    name, "§8", "only the bundle-root index.md may have frontmatter"
+                )
+            )
+        elif extra:
+            errors.append(
+                _problem(
+                    name,
+                    "§8",
+                    "bundle-root index.md frontmatter may only carry "
+                    f"okf_version, found {sorted(extra)}",
+                )
+            )
+    if not re.search(r"^#{1,6} ", body, re.MULTILINE):
+        warnings.append(_problem(name, "§8", "no section heading"))
+
+
+def _check_log(name: str, body: str, out) -> None:
+    errors, warnings = out
+    dates: List[str] = []
+    for line in body.splitlines():
+        if not line.startswith("## "):
+            continue
+        match = _LOG_DATE_HEADING.match(line)
+        if not match:
+            errors.append(
+                _problem(name, "§9", f"date heading is not YYYY-MM-DD: {line!r}")
+            )
+            continue
+        try:
+            datetime.date.fromisoformat(match.group(1))
+        except ValueError:
+            errors.append(_problem(name, "§9", f"not a real date: {line!r}"))
+            continue
+        dates.append(match.group(1))
+    if dates != sorted(dates, reverse=True):
+        warnings.append(_problem(name, "§9", "entries are not newest first"))
 
 
 def validate_bundle(bundle_dir: str) -> Dict[str, Any]:
@@ -494,7 +352,7 @@ def validate_bundle(bundle_dir: str) -> Dict[str, Any]:
 
     for file in sorted(root.rglob("*.md")):
         rel = file.relative_to(root)
-        if any(part.startswith(".") for part in rel.parts):
+        if any(part.startswith(".") for part in rel.parts) or not file.is_file():
             continue
         name = rel.as_posix()
         try:
@@ -510,60 +368,15 @@ def validate_bundle(bundle_dir: str) -> Dict[str, Any]:
             )
             continue
 
-        if file.name == "index.md":
-            if frontmatter is not None:
-                at_root = rel.parent == Path(".")
-                extra = (
-                    set(frontmatter) - {"okf_version"}
-                    if isinstance(frontmatter, dict)
-                    else {"?"}
-                )
-                if not at_root:
-                    errors.append(
-                        _problem(
-                            name,
-                            "§8",
-                            "only the bundle-root index.md may have frontmatter",
-                        )
-                    )
-                elif extra:
-                    errors.append(
-                        _problem(
-                            name,
-                            "§8",
-                            f"bundle-root index.md frontmatter may only carry okf_version, found {sorted(extra)}",
-                        )
-                    )
-            if not re.search(r"^#{1,6} ", body, re.MULTILINE):
-                warnings.append(_problem(name, "§8", "no section heading"))
+        if file.name.lower() == "index.md":
+            at_root = rel.parent == Path(".")
+            _check_index(name, at_root, frontmatter, body, (errors, warnings))
             continue
-
-        if file.name == "log.md":
-            dates: List[str] = []
-            for line in body.splitlines():
-                if line.startswith("## "):
-                    match = _LOG_DATE_HEADING.match(line)
-                    if not match:
-                        errors.append(
-                            _problem(
-                                name, "§9", f"date heading is not YYYY-MM-DD: {line!r}"
-                            )
-                        )
-                        continue
-                    try:
-                        datetime.date.fromisoformat(match.group(1))
-                    except ValueError:
-                        errors.append(
-                            _problem(name, "§9", f"not a real date: {line!r}")
-                        )
-                        continue
-                    dates.append(match.group(1))
-            if dates != sorted(dates, reverse=True):
-                warnings.append(_problem(name, "§9", "entries are not newest first"))
+        if file.name.lower() == "log.md":
+            _check_log(name, body, (errors, warnings))
             continue
 
         concepts += 1
-        concept_id = rel.with_suffix("").as_posix()
         if frontmatter is None:
             errors.append(_problem(name, "§11.1", "no YAML frontmatter block"))
             continue
@@ -574,6 +387,7 @@ def validate_bundle(bundle_dir: str) -> Dict[str, Any]:
         if not isinstance(kind, str) or not kind.strip():
             errors.append(_problem(name, "§11.2", "missing or empty `type`"))
             continue
+        concept_id = rel.with_suffix("").as_posix()
         concept_ids.add(concept_id)
         bodies.append((concept_id, body))
 
@@ -594,3 +408,13 @@ def validate_bundle(bundle_dir: str) -> Dict[str, Any]:
         "errors": errors,
         "warnings": warnings,
     }
+
+
+__all__ = [
+    "BundleError",
+    "EXPORT_MANIFEST",
+    "RESERVED_FILENAMES",
+    "export_bundle",
+    "import_bundle",
+    "validate_bundle",
+]

@@ -294,6 +294,23 @@ def render_document(frontmatter: Dict[str, Any], body: str) -> str:
     return f"---\n{dumped}---\n{body}"
 
 
+def _join_surrogates(value: Any) -> Any:
+    r"""Recombine UTF-16 surrogate pairs in loaded strings. JSON-style
+    escapes such as "\ud83d\ude00" (how json.dumps writes an emoji) are
+    common in machine-written YAML, and PyYAML decodes each half as a lone
+    surrogate: a str that can't be encoded to UTF-8 or stored. A lone
+    surrogate with no partner becomes U+FFFD."""
+    if isinstance(value, str):
+        if any("\ud800" <= ch <= "\udfff" for ch in value):
+            return value.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+        return value
+    if isinstance(value, list):
+        return [_join_surrogates(v) for v in value]
+    if isinstance(value, dict):
+        return {_join_surrogates(k): _join_surrogates(v) for k, v in value.items()}
+    return value
+
+
 def parse_frontmatter(text: str) -> Tuple[Optional[Any], str]:
     """Split a document into (parsed frontmatter, body). Frontmatter is None
     when the document has no frontmatter block. Raises yaml.YAMLError when
@@ -301,4 +318,5 @@ def parse_frontmatter(text: str) -> Tuple[Optional[Any], str]:
     match = _FRONTMATTER.match(text)
     if not match:
         return None, text
-    return yaml.load(match.group("yaml"), Loader=_OKFLoader), match.group("body")
+    loaded = yaml.load(match.group("yaml"), Loader=_OKFLoader)
+    return _join_surrogates(loaded), match.group("body")
