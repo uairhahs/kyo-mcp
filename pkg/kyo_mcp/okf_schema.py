@@ -156,6 +156,11 @@ class OKFConcept(BaseModel):
     # Ontology annotations (Kyo extension)
     ontology: Optional[OntologyAnnotation] = None
 
+    # The concept's OKF Concept ID (§2): its file path in a bundle, relative
+    # to the bundle root, without the `.md` suffix. Kyo storage only, never
+    # frontmatter: inside a bundle the file's location *is* the id.
+    bundle_path: Optional[str] = None
+
     @field_validator("resource", mode="before")
     @classmethod
     def _resource_from_uri(cls, value: Any) -> Any:
@@ -232,24 +237,20 @@ class OKFConcept(BaseModel):
             frontmatter.setdefault(key, value)
         return frontmatter
 
+    def default_body(self) -> str:
+        """The minimal body used when a concept has none of its own."""
+        body = f"# {self.title or 'Untitled'}\n"
+        if self.description:
+            body += f"\n{self.description}\n"
+        return body
+
     def to_markdown(self, body: str = "") -> str:
         """Serialize the concept as an OKF concept document (§4).
 
         `body` is the concept's markdown body. When empty, a minimal body is
         generated from the title and description instead.
         """
-        if not body:
-            body = f"# {self.title or 'Untitled'}\n"
-            if self.description:
-                body += f"\n{self.description}\n"
-
-        dumped = yaml.safe_dump(
-            self.to_frontmatter(),
-            default_flow_style=False,
-            sort_keys=False,
-            allow_unicode=True,
-        )
-        return f"---\n{dumped}---\n{body}"
+        return render_document(self.to_frontmatter(), body or self.default_body())
 
     @classmethod
     def from_frontmatter(cls, frontmatter: Dict[str, Any]) -> "OKFConcept":
@@ -257,7 +258,9 @@ class OKFConcept(BaseModel):
         isn't a modelled field into `metadata` (§4.1)."""
         if not isinstance(frontmatter, dict):
             raise ValueError("OKF frontmatter must be a YAML mapping")
-        modelled = set(cls.model_fields) - {"id", "metadata"}
+        # bundle_path is storage-only (see the field), so a frontmatter key
+        # of that name is an ordinary extension.
+        modelled = set(cls.model_fields) - {"id", "metadata", "bundle_path"}
         data: Dict[str, Any] = {}
         extras: Dict[str, Any] = {}
         for key, value in frontmatter.items():
@@ -277,8 +280,25 @@ class OKFConcept(BaseModel):
         Raises ValueError when there is no frontmatter block, and pydantic's
         ValidationError when `type`, the one required key (§4.1), is missing.
         """
-        match = _FRONTMATTER.match(text)
-        if not match:
+        if not _FRONTMATTER.match(text):
             raise ValueError("Not an OKF concept document: no frontmatter block")
-        frontmatter = yaml.load(match.group("yaml"), Loader=_OKFLoader) or {}
-        return cls.from_frontmatter(frontmatter), match.group("body")
+        frontmatter, body = parse_frontmatter(text)
+        return cls.from_frontmatter(frontmatter or {}), body
+
+
+def render_document(frontmatter: Dict[str, Any], body: str) -> str:
+    """Render frontmatter and a body as an OKF markdown document (§4)."""
+    dumped = yaml.safe_dump(
+        frontmatter, default_flow_style=False, sort_keys=False, allow_unicode=True
+    )
+    return f"---\n{dumped}---\n{body}"
+
+
+def parse_frontmatter(text: str) -> Tuple[Optional[Any], str]:
+    """Split a document into (parsed frontmatter, body). Frontmatter is None
+    when the document has no frontmatter block. Raises yaml.YAMLError when
+    the block isn't valid YAML."""
+    match = _FRONTMATTER.match(text)
+    if not match:
+        return None, text
+    return yaml.load(match.group("yaml"), Loader=_OKFLoader), match.group("body")

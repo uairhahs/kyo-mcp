@@ -30,13 +30,13 @@ import json
 import sys
 from typing import Any
 
+from kyo_mcp.common import GENERATOR, new_node_id, now_iso
 from kyo_mcp.database import (
     create_concept,
     create_link,
     get_concept_by_id,
     query_catalog,
 )
-from kyo_mcp.common import GENERATOR, new_node_id, now_iso
 from kyo_mcp.okf_schema import OKFConcept
 
 
@@ -176,6 +176,33 @@ async def cmd_trigger_reflection(args: argparse.Namespace) -> Any:
     return {"query": query, "result": result}
 
 
+def cmd_export_bundle(args: argparse.Namespace) -> Any:
+    """Export the catalogue as an OKF v0.2 bundle."""
+    from kyo_mcp.bundle import export_bundle
+
+    return export_bundle(args.out_dir, overwrite=args.overwrite)
+
+
+def cmd_import_bundle(args: argparse.Namespace) -> Any:
+    """Import an OKF bundle into the catalogue."""
+    from kyo_mcp.bundle import import_bundle
+
+    return import_bundle(args.bundle_dir)
+
+
+def cmd_validate_bundle(args: argparse.Namespace) -> Any:
+    """Check a bundle against OKF v0.2 conformance (§11)."""
+    from kyo_mcp.bundle import validate_bundle
+
+    result = validate_bundle(args.bundle_dir)
+    if not result["conformant"]:
+        raise CommandError(
+            f"{len(result['errors'])} conformance error(s): "
+            + json.dumps(result["errors"])
+        )
+    return result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Kyo CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -229,6 +256,25 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("trigger_consolidation").set_defaults(
         func=cmd_trigger_consolidation
     )
+
+    p = subparsers.add_parser("export_bundle", help="Export as an OKF v0.2 bundle")
+    p.add_argument("out_dir")
+    p.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace a previous Kyo export in out_dir",
+    )
+    p.set_defaults(func=cmd_export_bundle)
+
+    p = subparsers.add_parser("import_bundle", help="Import an OKF bundle")
+    p.add_argument("bundle_dir")
+    p.set_defaults(func=cmd_import_bundle)
+
+    p = subparsers.add_parser(
+        "validate_bundle", help="Check OKF v0.2 conformance; exit 1 if not"
+    )
+    p.add_argument("bundle_dir")
+    p.set_defaults(func=cmd_validate_bundle)
 
     p = subparsers.add_parser("trigger_reflection")
     p.add_argument(

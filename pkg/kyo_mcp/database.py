@@ -196,6 +196,13 @@ def initialize_db(db_path: Path) -> None:
     get_connection(db_path)
 
 
+# Where a concept's OKF bundle path is kept inside the metadata JSON column.
+# Stored there rather than in a column of its own so no schema migration is
+# needed: migration numbers are positional, and another branch already
+# claims v6. Prefixed so it can't collide with a producer's extension key.
+BUNDLE_PATH_KEY = "_kyo_bundle_path"
+
+
 class ConceptExistsError(ValueError):
     """Raised by create_concept(update_existing=False) on an id collision."""
 
@@ -212,6 +219,7 @@ def _concept_row(
         "sources": data.get("sources") or [],
         "stale_after": data.get("stale_after"),
         "ontology": data.get("ontology"),
+        BUNDLE_PATH_KEY: data.get("bundle_path"),
     }
     return {
         "id": data["id"],
@@ -240,6 +248,7 @@ def create_concept(
     instead of being overwritten. With update_existing=True, an existing
     concept is replaced, but its verification history is kept: new
     `verified` entries are appended to the stored ones, not substituted.
+    Its bundle path is kept too, unless concept_dict gives a new one.
     """
     validated = OKFConcept.model_validate(concept_dict)
     if not validated.id:
@@ -254,10 +263,16 @@ def create_concept(
         if existing and not update_existing:
             raise ConceptExistsError(f"Concept {validated.id} already exists")
 
-        verified = (
-            _load_json(existing["metadata"]).get("verified", []) if existing else []
-        )
+        stored = _load_json(existing["metadata"]) if existing else {}
+        verified = stored.get("verified", [])
         verified += [v for v in new_verified if v not in verified]
+        # Like verification history, the bundle path outlives a replace that
+        # doesn't name one, so the node keeps its file (and inbound links)
+        # on the next export. set_bundle_path is how to change or clear it.
+        if validated.bundle_path is None and stored.get(BUNDLE_PATH_KEY):
+            validated = validated.model_copy(
+                update={"bundle_path": stored[BUNDLE_PATH_KEY]}
+            )
         row = _concept_row(validated, verified)
         row["body_text"] = markdown_body
 
@@ -339,6 +354,7 @@ def _deserialize_concept(row: sqlite3.Row) -> Dict[str, Any]:
     row_dict["sources"] = metadata.pop("sources", [])
     row_dict["stale_after"] = metadata.pop("stale_after", None)
     row_dict["ontology"] = metadata.pop("ontology", None)
+    row_dict["bundle_path"] = metadata.pop(BUNDLE_PATH_KEY, None)
     # What remains is OKFConcept.metadata: arbitrary extra keys, stored
     # alongside the trust fields above in the same JSON column.
     row_dict["metadata"] = metadata
@@ -660,3 +676,51 @@ def get_all_links(db_path: Optional[Path] = None) -> List[Dict[str, Any]]:
         "SELECT source_id, target_id, relation_type FROM knowledge_links"
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def set_bundle_path(
+    concept_id: str, bundle_path: Optional[str], db_path: Optional[Path] = None
+) -> None:
+    """Record a concept's OKF bundle path without touching its content or
+    updated_at, so assigning paths on export doesn't reorder the catalogue."""
+    conn = get_connection(db_path)
+    with _lock, conn:
+        row = conn.execute(
+            "SELECT metadata FROM knowledge_concepts WHERE id = ?", (concept_id,)
+        ).fetchone()
+        if row is None:
+            return
+        metadata = _load_json(row["metadata"])
+        if bundle_path:
+            metadata[BUNDLE_PATH_KEY] = bundle_path
+        else:
+            metadata.pop(BUNDLE_PATH_KEY, None)
+        conn.execute(
+            "UPDATE knowledge_concepts SET metadata = ? WHERE id = ?",
+            (json.dumps(metadata), concept_id),
+        )
+
+
+def find_concept_by_bundle_path(
+    bundle_path: str, db_path: Optional[Path] = None
+) -> Optional[Dict[str, Any]]:
+    """The concept last exported to, or imported from, `bundle_path`."""
+    row = (
+        get_connection(db_path)
+        .execute(
+            "SELECT * FROM knowledge_concepts "
+            "WHERE json_extract(metadata, ?) = ? LIMIT 1",
+            (f"$.{BUNDLE_PATH_KEY}", bundle_path),
+        )
+        .fetchone()
+    )
+    return _deserialize_concept(row) if row else None
+
+
+def delete_outgoing_links(source_id: str, db_path: Optional[Path] = None) -> int:
+    """Delete every link whose source is `source_id`. Returns how many."""
+    conn = get_connection(db_path)
+    with _lock, conn:
+        return conn.execute(
+            "DELETE FROM knowledge_links WHERE source_id = ?", (source_id,)
+        ).rowcount

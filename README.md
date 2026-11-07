@@ -2,7 +2,7 @@
 
 **MCP 2026-07-28 | Mnemosyne | Hindsight | OKF v0.2**
 
-Kyo (経) is a knowledge graph MCP server that implements Google's Open Knowledge Format (OKF) v0.2 with integrated spaced repetition (Mnemosyne) and AI-powered fact extraction (Hindsight). It runs as a stateless MCP server using the new Anthropic MCP 2026-07-28 protocol.
+Kyo (経) is a knowledge graph MCP server that reads and writes Google's Open Knowledge Format (OKF) v0.2 with integrated spaced repetition (Mnemosyne) and AI-powered fact extraction (Hindsight). It runs as a stateless MCP server using the new Anthropic MCP 2026-07-28 protocol.
 
 ## Architecture
 
@@ -29,7 +29,7 @@ Kyo (経) is a knowledge graph MCP server that implements Google's Open Knowledg
 
 ## Features
 
-- **OKF v0.2 Compliance**: Structured knowledge concepts with trust signals, provenance, and freshness metadata
+- **OKF v0.2 bundles**: Exports and imports conformant OKF v0.2 bundles (directories of markdown files), with trust, provenance, and freshness metadata. See [OKF v0.2 conformance](#okf-v02-conformance)
 - **MCP 2026-07-28**: Stateless protocol, MRTR, Streamable HTTP transport
 - **Mnemosyne Integration**: Spaced repetition for long-term knowledge retention
 - **Hindsight Integration**: AI-powered fact extraction and semantic search via a local LLM
@@ -71,6 +71,7 @@ kyo/
 │   │   ├── cli.py         # kyo-cli command
 │   │   ├── database.py    # SQLite schema, migrations, FTS5 search
 │   │   ├── okf_schema.py  # OKF v0.2 Pydantic models
+│   │   ├── bundle.py      # OKF bundle export, import, validation
 │   │   ├── ontology.py    # SKOS/Dublin Core + RDF export
 │   │   ├── bridge.py      # Mnemosyne + Hindsight sync
 │   │   └── __init__.py
@@ -79,7 +80,9 @@ kyo/
 │   └── README.md
 ├── docs/
 │   ├── OKF.md             # OKF overview (reference agent README)
-│   └── SPEC.md            # OKF v0.2 specification, vendored from upstream
+│   ├── SPEC.md            # OKF v0.2 specification, vendored from upstream
+│   ├── THIRD_PARTY.md     # Source and license of vendored files
+│   └── LICENSE.knowledge-catalog
 ├── README.md
 └── .codebase-memory/      # Codebase knowledge graph config
 ```
@@ -103,12 +106,57 @@ kyo/
 | `sync_to_hindsight`           | Queue a node for Hindsight fact extraction                       |
 | `check_hindsight_sync_status` | Check whether a queued Hindsight extraction has finished         |
 | `recall_from_hindsight`       | Semantic search across synced concepts                           |
+| `materialize_from_hindsight`  | Pull recalled Hindsight memories back in as catalogue nodes      |
 | `trigger_reflection`          | Generate insights from the knowledge base                        |
 | `trigger_consolidation`       | Strengthen memory associations                                   |
 | `sync_all_to_memory_systems`  | Sync every changed node, and check pending Hindsight extractions |
+| `export_okf_bundle`           | Write the catalogue as an OKF v0.2 bundle directory              |
+| `import_okf_bundle`           | Load an OKF bundle directory into the catalogue                  |
+| `validate_okf_bundle`         | Check a directory against OKF v0.2 conformance (§11)             |
 
 Failures are returned as MCP tool errors (`isError: true`), not as
 successful results containing error text.
+
+## OKF v0.2 conformance
+
+Kyo reads and writes [OKF v0.2](docs/SPEC.md) bundles (SPEC.md as of
+upstream commit `62432a0`). Bundles it exports are conformant under §11,
+and it consumes any conformant bundle. This is tested against Google's own
+sample bundles (`pkg/tests/fixtures/okf/`): each one is imported and
+exported again, and every concept file comes back at the same path with
+the same body and the same frontmatter keys and values.
+
+- **Bundles**: `export_okf_bundle` / `kyo-cli export_bundle DIR` writes one
+  markdown file per node plus an `index.md` per directory (§8), with
+  `okf_version: "0.2"` at the root. A node's file path is its OKF concept
+  ID (§2) and stays the same across exports. `import_okf_bundle` /
+  `kyo-cli import_bundle DIR` loads one, tolerating unknown types and keys,
+  missing index files, and broken links (§11). `validate_okf_bundle` /
+  `kyo-cli validate_bundle DIR` checks the §11 rules.
+- **Links**: links between concepts are standard markdown links (§6.1).
+  OKF links are untyped, so Kyo's typed links are kept in a `kyo_links`
+  extension key, and also written as ordinary links in a generated
+  `## Links` section so plain OKF consumers see the edge.
+- **Trust, provenance, lifecycle (§5)**: `generated`, `verified` (a bare
+  mapping is read as one entry), trust tiers derived per §5.3, `sources`
+  with their credibility signals, `status`, and `stale_after`. Timestamps
+  are ISO 8601 with an explicit offset.
+- **Extensions (§4.1)**: unknown frontmatter keys are preserved through
+  storage and export. Kyo adds `kyo_id` (its node id), `kyo_links`, and
+  `ontology`.
+
+Limits:
+
+- **Attested Computations (§10)** are stored and round-tripped, but Kyo
+  doesn't run executors or attesters, so it can't surface a failing
+  attestation (§11 asks consumers to).
+- **Semantically lossless, not byte-identical**: keys and values survive,
+  but YAML layout and key order are rewritten, an absent `status` is
+  written as `stable`, and a bare `verified` mapping as a one-entry list.
+- **`index.md` and `log.md` aren't imported**: on export, Kyo generates
+  its own index files and writes no `log.md` (optional, §9).
+- **The SQLite catalogue is the store**: bundles are exported from and
+  imported into it, rather than being the store themselves.
 
 ## Configuration
 

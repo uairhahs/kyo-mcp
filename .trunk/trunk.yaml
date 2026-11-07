@@ -32,12 +32,14 @@ lint:
     - trufflehog@3.97.5
     - yamllint@1.38.0
   ignore:
-    # Vendored verbatim from GoogleCloudPlatform/knowledge-catalog
-    # okf/SPEC.md; reformatting it would make it drift from the pinned
-    # upstream copy.
+    # Vendored verbatim from GoogleCloudPlatform/knowledge-catalog (see
+    # docs/THIRD_PARTY.md); reformatting would make them drift from the
+    # pinned upstream copies.
     - linters: [ALL]
       paths:
         - docs/SPEC.md
+        - docs/LICENSE.knowledge-catalog
+        - pkg/tests/fixtures/okf/**
 actions:
   disabled:
     - trunk-announce

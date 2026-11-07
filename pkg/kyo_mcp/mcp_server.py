@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 import networkx as nx
 from kyo_mcp.bridge import BridgeLayer
+from kyo_mcp.bundle import BundleError, export_bundle, import_bundle, validate_bundle
 from kyo_mcp.common import GENERATOR, is_stale, new_node_id, now_iso
 from kyo_mcp.database import (
     create_concept,
@@ -473,6 +474,88 @@ async def sync_all_to_memory_systems() -> str:
     output += f"  Hindsight extractions completed since last check: {stats['hindsight_completed']}\n"
     if bridge.last_error:
         output += f"  Last error: {bridge.last_error}\n"
+    return output
+
+
+def _format_problems(problems: List[Dict[str, str]], limit: int = 20) -> str:
+    lines = [f"  - {p['path']} [{p['rule']}] {p['message']}" for p in problems[:limit]]
+    if len(problems) > limit:
+        lines.append(f"  ... and {len(problems) - limit} more")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def export_okf_bundle(out_dir: str, overwrite: bool = False) -> str:
+    """Export the whole catalogue as an OKF v0.2 bundle: a directory of
+    markdown concept files plus generated index.md files (docs/SPEC.md).
+
+    out_dir must be missing or empty. With overwrite=True it may instead
+    hold a previous Kyo export, whose files are replaced. Each node keeps
+    the same file path across exports, so links into the bundle stay valid.
+    """
+    try:
+        result = export_bundle(out_dir, overwrite=overwrite)
+    except BundleError as e:
+        raise ToolError(str(e)) from e
+    validation = result["validation"]
+    output = (
+        f"Exported {result['concepts']} concept(s) to {result['bundle']}\n"
+        f"  Index files: {result['index_files']}\n"
+        f"  Typed links written: {result['typed_links']}\n"
+        f"  New file paths assigned: {result['paths_assigned']}\n"
+        f"  OKF v0.2 conformant: {'yes' if validation['conformant'] else 'NO'}\n"
+    )
+    if validation["errors"]:
+        output += _format_problems(validation["errors"]) + "\n"
+    return output
+
+
+@mcp.tool()
+async def import_okf_bundle(bundle_dir: str) -> str:
+    """Import an OKF bundle (a directory of markdown concept files) into the
+    catalogue. Nodes are matched by `kyo_id`, then by file path; anything
+    else is created. Markdown links between concepts become `references`
+    links. Broken links and files that aren't concept documents are
+    reported, not fatal."""
+    try:
+        result = import_bundle(bundle_dir)
+    except BundleError as e:
+        raise ToolError(str(e)) from e
+    output = (
+        f"Imported {result['concepts']} concept(s) from {result['bundle']}\n"
+        f"  Created: {result['created']}, updated: {result['updated']}\n"
+        f"  Links: {result['inline_links']} from markdown, "
+        f"{result['typed_links']} typed\n"
+    )
+    if result["broken_links"]:
+        output += f"  Broken links (kept in the text, not linked): {len(result['broken_links'])}\n"
+    if result["skipped"]:
+        output += (
+            "  Skipped files:\n"
+            + "\n".join(f"  - {s['path']}: {s['reason']}" for s in result["skipped"])
+            + "\n"
+        )
+    return output
+
+
+@mcp.tool()
+async def validate_okf_bundle(bundle_dir: str) -> str:
+    """Check a directory against the OKF v0.2 conformance rules (§11): every
+    concept file has YAML frontmatter with a non-empty `type`, and any
+    index.md / log.md follows §8 / §9. Warnings are soft guidance."""
+    try:
+        result = validate_bundle(bundle_dir)
+    except BundleError as e:
+        raise ToolError(str(e)) from e
+    verdict = "conformant" if result["conformant"] else "NOT conformant"
+    output = (
+        f"{bundle_dir}: {verdict} with OKF v{result['okf_version']} "
+        f"({result['concepts']} concept(s))\n"
+    )
+    if result["errors"]:
+        output += f"Errors:\n{_format_problems(result['errors'])}\n"
+    if result["warnings"]:
+        output += f"Warnings:\n{_format_problems(result['warnings'])}\n"
     return output
 
 
