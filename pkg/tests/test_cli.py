@@ -117,3 +117,16 @@ async def test_delete_concept_kept_when_remote_delete_fails(capsys):
     code, out, _ = await run_cli(capsys, "delete_concept", concept_id, "--local-only")
     assert code == 0
     assert out == {"deleted": True, "concept_id": concept_id}
+
+
+@pytest.mark.asyncio
+async def test_refresh_reports_its_own_pass(capsys):
+    """Regression: run() refreshed before every command, so `refresh`
+    printed a second, no-op pass and hid what the first one did."""
+    from kyo_mcp.database import create_concept
+
+    # An index-only row has no file yet, so a refresh writes one.
+    create_concept({"id": "kyo-unfiled", "type": "t", "title": "Unfiled"}, "x\n")
+    assert await run(["refresh"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["written"] == 1 and report["indexed"] == 1

@@ -334,7 +334,10 @@ async def run(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         # The bundle is the source of truth: see edits made to it directly.
-        if args.func is not cmd_validate_bundle:
+        # Not for `refresh`, which refreshes and reports itself (a refresh
+        # first would leave it reporting a second, no-op pass), nor for
+        # `validate_bundle`, which reads a directory, not the catalogue.
+        if args.func not in (cmd_refresh, cmd_validate_bundle):
             store.refresh()
         result = args.func(args)
         if inspect.isawaitable(result):
