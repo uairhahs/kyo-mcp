@@ -149,6 +149,30 @@ class TestProcessing:
         assert db.list_pending_deletions() == []
 
     @pytest.mark.asyncio
+    async def test_finished_operation_does_not_block_the_deletion(self, monkeypatch):
+        """Regression: Hindsight answers 409 to cancelling an operation that
+        already completed or failed, which used to fail the whole deletion,
+        so the tombstone was retried forever."""
+        _fake_mnemosyne(monkeypatch)
+        synced_node(operation="op-done").unlink()
+        store.refresh()
+        finished = _mock_response(
+            409, text="cannot be cancelled: status is 'failed', only 'pending'"
+        )
+        with patch(
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            side_effect=[finished, _mock_response(404)],
+        ) as request:
+            stats = await BridgeLayer().process_pending_deletions()
+        assert stats == {"completed": 1, "failed": 0}
+        assert calls(request) == [
+            ("DELETE", "operations/op-done"),
+            ("DELETE", "documents/kyo-a"),
+        ]
+        assert db.list_pending_deletions() == []
+
+    @pytest.mark.asyncio
     async def test_sync_all_processes_tombstones_first(self, monkeypatch):
         _fake_mnemosyne(monkeypatch)
         synced_node().unlink()
