@@ -142,6 +142,31 @@ def _migrate_v5(cursor: sqlite3.Cursor) -> None:
     _add_columns(cursor, ["hindsight_failed_operation_id"])
 
 
+def _migrate_v6(cursor: sqlite3.Cursor) -> None:
+    """The id Mnemosyne returned for each node's current memory. Mnemosyne
+    can only forget a memory by id, so without it a deleted or rewritten
+    node's memory stays behind forever."""
+    _add_columns(cursor, ["mnemosyne_memory_id"])
+
+
+def _migrate_v7(cursor: sqlite3.Cursor) -> None:
+    """Memories still to be removed from Hindsight and Mnemosyne for
+    concepts that left the catalogue without the delete tool removing them:
+    their file was deleted, moved without a kyo_id, or replaced by another
+    concept (kyo_mcp/store.py). The bridge removes them on the next sync
+    (BridgeLayer.process_pending_deletions)."""
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pending_deletions (
+            node_id TEXT PRIMARY KEY,
+            mnemosyne_memory_id TEXT,
+            hindsight_operation_id TEXT,
+            deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT
+        )
+    """)
+
+
 # Append-only: each entry upgrades the schema from version i to i + 1, and
 # PRAGMA user_version records how many have been applied.
 MIGRATIONS: List[Callable[[sqlite3.Cursor], None]] = [
@@ -150,6 +175,8 @@ MIGRATIONS: List[Callable[[sqlite3.Cursor], None]] = [
     _migrate_v3,
     _migrate_v4,
     _migrate_v5,
+    _migrate_v6,
+    _migrate_v7,
 ]
 
 
@@ -316,6 +343,11 @@ def create_concept(
                 row,
             )
         else:
+            # The concept is back (say, its file was restored), so its
+            # memories must stay: cancel any pending deletion.
+            connection.execute(
+                "DELETE FROM pending_deletions WHERE node_id = ?", (validated.id,)
+            )
             connection.execute(
                 """
                 INSERT INTO knowledge_concepts
@@ -346,11 +378,36 @@ def update_concept(
         return get_concept_by_id(concept_id, db_path=db_path)
 
 
-def delete_concept(concept_id: str, db_path: Optional[Path] = None) -> bool:
+def delete_concept(
+    concept_id: str, db_path: Optional[Path] = None, tombstone: bool = False
+) -> bool:
     """Delete a concept and every link touching it. Returns False if it
-    didn't exist."""
+    didn't exist.
+
+    With tombstone=True, and if the concept was ever synced to Hindsight or
+    Mnemosyne, it is recorded in pending_deletions with what's needed to
+    remove those memories later, since the row that tracks them is going.
+    """
     connection = get_connection(db_path)
     with _lock, connection:
+        if tombstone:
+            row = connection.execute(
+                "SELECT mnemosyne_memory_id, mnemosyne_synced_hash, "
+                "hindsight_operation_id, hindsight_synced_hash, "
+                "hindsight_pending_hash FROM knowledge_concepts WHERE id = ?",
+                (concept_id,),
+            ).fetchone()
+            if row is not None and any(row):
+                connection.execute(
+                    "INSERT OR REPLACE INTO pending_deletions "
+                    "(node_id, mnemosyne_memory_id, hindsight_operation_id) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        concept_id,
+                        row["mnemosyne_memory_id"],
+                        row["hindsight_operation_id"],
+                    ),
+                )
         connection.execute(
             "DELETE FROM knowledge_links WHERE source_id = ? OR target_id = ?",
             (concept_id, concept_id),
@@ -359,6 +416,51 @@ def delete_concept(concept_id: str, db_path: Optional[Path] = None) -> bool:
             "DELETE FROM knowledge_concepts WHERE id = ?", (concept_id,)
         )
     return cursor.rowcount > 0
+
+
+def list_pending_deletions(db_path: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """Concepts whose synced memories still need removing, oldest first."""
+    rows = (
+        get_connection(db_path)
+        .execute("SELECT * FROM pending_deletions ORDER BY deleted_at, node_id")
+        .fetchall()
+    )
+    return [dict(row) for row in rows]
+
+
+def get_pending_deletion(
+    node_id: str, db_path: Optional[Path] = None
+) -> Optional[Dict[str, Any]]:
+    row = (
+        get_connection(db_path)
+        .execute("SELECT * FROM pending_deletions WHERE node_id = ?", (node_id,))
+        .fetchone()
+    )
+    return dict(row) if row else None
+
+
+def clear_pending_deletion(node_id: str, db_path: Optional[Path] = None) -> bool:
+    """Drop a tombstone: its memories are gone, or are to be kept."""
+    conn = get_connection(db_path)
+    with _lock, conn:
+        return (
+            conn.execute(
+                "DELETE FROM pending_deletions WHERE node_id = ?", (node_id,)
+            ).rowcount
+            > 0
+        )
+
+
+def record_pending_deletion_failure(
+    node_id: str, error: str, db_path: Optional[Path] = None
+) -> None:
+    conn = get_connection(db_path)
+    with _lock, conn:
+        conn.execute(
+            "UPDATE pending_deletions SET attempts = attempts + 1, last_error = ? "
+            "WHERE node_id = ?",
+            (error, node_id),
+        )
 
 
 def _load_json(raw: Optional[str]) -> Dict[str, Any]:
@@ -409,10 +511,10 @@ _STOPWORDS = frozenset("""
 
 
 def _fts_terms(search_term: str) -> List[str]:
-    """Split free text into search terms, dropping stopwords -- unless
-    that would leave nothing to search for, in which case the original
-    words are kept so the query still runs (and legitimately finds
-    nothing) rather than silently searching for an empty string."""
+    """Split free text into search terms, dropping stopwords, unless
+    that would leave nothing to search for. Then the original words are
+    kept, so the query still runs (and legitimately finds nothing) rather
+    than silently searching for an empty string."""
     words = search_term.split()
     filtered = [w for w in words if w.lower() not in _STOPWORDS]
     return filtered or words
@@ -555,6 +657,30 @@ def set_sync_hash(
         conn.execute(
             f"UPDATE knowledge_concepts SET {column} = ? WHERE id = ?",  # nosec B608
             (content_hash, node_id),
+        )
+
+
+def get_mnemosyne_memory_id(
+    node_id: str, db_path: Optional[Path] = None
+) -> Optional[str]:
+    """Return the id of this node's current Mnemosyne memory, or None if
+    it was never synced (or was synced before ids were tracked)."""
+    conn = get_connection(db_path)
+    row = conn.execute(
+        "SELECT mnemosyne_memory_id FROM knowledge_concepts WHERE id = ?",
+        (node_id,),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def set_mnemosyne_memory_id(
+    node_id: str, memory_id: Optional[str], db_path: Optional[Path] = None
+) -> None:
+    conn = get_connection(db_path)
+    with _lock, conn:
+        conn.execute(
+            "UPDATE knowledge_concepts SET mnemosyne_memory_id = ? WHERE id = ?",
+            (memory_id, node_id),
         )
 
 

@@ -25,14 +25,20 @@ from kyo_mcp import store
 from kyo_mcp.common import GENERATOR, now_iso
 from kyo_mcp.database import (
     clear_hindsight_operation,
+    clear_pending_deletion,
     fail_hindsight_operation,
     get_concept_by_id,
     get_failed_hindsight_operation,
     get_hindsight_operation,
+    get_mnemosyne_memory_id,
+    get_pending_deletion,
     get_sync_hash,
+    list_pending_deletions,
     list_pending_hindsight_operations,
     query_catalog,
+    record_pending_deletion_failure,
     set_hindsight_operation,
+    set_mnemosyne_memory_id,
     set_sync_hash,
     touch_concept,
 )
@@ -246,11 +252,11 @@ class BridgeLayer:
 
             # Imported only once there is something to sync: the import
             # alone takes ~0.6s, which an unchanged concept shouldn't pay.
-            from mnemosyne import remember
+            from mnemosyne import forget, remember
 
             # remember() is synchronous and may do disk or model work, so
             # it runs in a worker thread to keep the event loop free.
-            await asyncio.to_thread(
+            memory_id = await asyncio.to_thread(
                 remember,
                 content,
                 metadata={
@@ -262,6 +268,13 @@ class BridgeLayer:
                     "created_at": concept.generated.at if concept.generated else None,
                 },
             )
+            # The node's content changed, so its previous memory is stale;
+            # forgetting it keeps one memory per node instead of one per
+            # edit.
+            previous_id = get_mnemosyne_memory_id(concept.id, db_path=self.db_path)
+            if previous_id and previous_id != memory_id:
+                await asyncio.to_thread(forget, previous_id)
+            set_mnemosyne_memory_id(concept.id, memory_id, db_path=self.db_path)
             set_sync_hash(concept.id, "mnemosyne", new_hash, db_path=self.db_path)
             logger.info(f"Synced concept {concept.id} to Mnemosyne")
             return True
@@ -373,6 +386,67 @@ class BridgeLayer:
         except Exception as e:
             self._fail(f"Failed to submit concept {concept.id} to Hindsight: {e}")
             return False
+
+    async def delete_concept_from_memory_systems(self, node_id: str) -> Dict[str, str]:
+        """Remove what a node synced to Hindsight and Mnemosyne, so a
+        deleted node can't be recalled or materialized back into the
+        catalogue.
+
+        Hindsight: any in-flight retain is cancelled, then the node's
+        document (document_id is the node id) is deleted along with every
+        fact extracted from it. Mnemosyne: the node's tracked memory is
+        forgotten.
+
+        Returns a status per system: "deleted", "not_found" (nothing
+        there to delete), "untracked" (Mnemosyne only: synced before
+        memory ids were recorded, so it can't be found), or "error" with
+        last_error set. Local state is left untouched either way.
+
+        Works for a node that's already gone from the catalogue too: what
+        its row tracked is then read from its tombstone (pending_deletions).
+        """
+        result = {"hindsight": "error", "mnemosyne": "error"}
+        tombstone = get_pending_deletion(node_id, db_path=self.db_path) or {}
+        try:
+            pending = get_hindsight_operation(node_id, db_path=self.db_path)
+            operation = (
+                pending[0] if pending else tombstone.get("hindsight_operation_id")
+            )
+            if operation:
+                response = await self._hindsight_request(
+                    "DELETE", f"operations/{operation}", timeout=STATUS_TIMEOUT
+                )
+                if response.status_code not in (200, 404):
+                    raise RuntimeError(
+                        f"cancelling operation {operation}: "
+                        f"HTTP {response.status_code} - {response.text}"
+                    )
+            response = await self._hindsight_request(
+                "DELETE", f"documents/{node_id}", timeout=STATUS_TIMEOUT
+            )
+            if response.status_code == 200:
+                result["hindsight"] = "deleted"
+            elif response.status_code == 404:
+                result["hindsight"] = "not_found"
+            else:
+                raise RuntimeError(f"HTTP {response.status_code} - {response.text}")
+        except Exception as e:
+            self._fail(f"Failed to delete {node_id} from Hindsight: {e}")
+
+        memory_id = get_mnemosyne_memory_id(
+            node_id, db_path=self.db_path
+        ) or tombstone.get("mnemosyne_memory_id")
+        if not memory_id:
+            result["mnemosyne"] = "untracked"
+            return result
+        try:
+            from mnemosyne import forget
+
+            forgotten = await asyncio.to_thread(forget, memory_id)
+            result["mnemosyne"] = "deleted" if forgotten else "not_found"
+        except Exception as e:
+            self._fail(f"Failed to delete {node_id} from Mnemosyne: {e}")
+        return result
 
     async def check_hindsight_operation(self, node_id: str) -> Dict[str, Any]:
         """Poll the status of a node's in-flight Hindsight sync operation.
@@ -488,10 +562,10 @@ class BridgeLayer:
 
         A recalled memory carrying an `okf_id` in its metadata (set by
         sync_concept_to_hindsight) maps back to the kyo node it was
-        synced from. If that node still exists locally, it is "touched"
-        -- its updated_at is bumped via touch_concept (index only),
-        with content left untouched -- so it re-enters the actively-used
-        working set instead of only existing as one-off recalled text.
+        synced from. If that node still exists locally, it is "touched":
+        its updated_at is bumped via touch_concept (index only), with
+        content left untouched, so it re-enters the actively-used working
+        set instead of only existing as one-off recalled text.
         Memories with no resolvable okf_id (native Hindsight memories, or
         ones synced before this provenance tracking existed) are
         materialized as new concepts instead, deterministically id'd from
@@ -598,6 +672,34 @@ class BridgeLayer:
             self._fail(f"Failed to trigger consolidation: {e}")
             return False
 
+    async def process_pending_deletions(self) -> Dict[str, int]:
+        """Remove the synced memories of concepts that left the catalogue
+        without the delete tool (a deleted, moved, or replaced file; see
+        kyo_mcp/store.py). A tombstone is cleared once both systems report
+        its memories gone; a failure is recorded and retried next time.
+
+        Returns counts: completed, failed.
+        """
+        stats = {"completed": 0, "failed": 0}
+        for tombstone in list_pending_deletions(db_path=self.db_path):
+            node_id = tombstone["node_id"]
+            self.last_error = None
+            await self.delete_concept_from_memory_systems(node_id)
+            if self.last_error:
+                record_pending_deletion_failure(
+                    node_id, self.last_error, db_path=self.db_path
+                )
+                stats["failed"] += 1
+            else:
+                clear_pending_deletion(node_id, db_path=self.db_path)
+                stats["completed"] += 1
+        if stats["failed"]:
+            self.last_error = (
+                f"{stats['failed']} pending memory deletion(s) failed; "
+                "they will be retried on the next sync"
+            )
+        return stats
+
     async def sync_all_concepts(self) -> Dict[str, int]:
         """Sync all concepts from the database to external systems.
 
@@ -607,14 +709,18 @@ class BridgeLayer:
 
         Returns:
             Dictionary of counts: total, mnemosyne_success,
-            hindsight_success (queued or already current), and
-            hindsight_completed (in-flight operations found finished)
+            hindsight_success (queued or already current),
+            hindsight_completed (in-flight operations found finished), and
+            deletions_completed / deletions_failed (memories of concepts
+            removed outside the delete tool, see process_pending_deletions)
         """
         stats = {
             "total": 0,
             "mnemosyne_success": 0,
             "hindsight_success": 0,
             "hindsight_completed": 0,
+            "deletions_completed": 0,
+            "deletions_failed": 0,
         }
         try:
             concepts = [
@@ -626,6 +732,11 @@ class BridgeLayer:
             async with httpx.AsyncClient() as client:
                 self._client = client
                 try:
+                    deletions = await self.process_pending_deletions()
+                    stats["deletions_completed"] = deletions["completed"]
+                    stats["deletions_failed"] = deletions["failed"]
+                    deletion_error = self.last_error
+
                     pending = list_pending_hindsight_operations(db_path=self.db_path)
                     checks = await self._gather_limited(
                         [self.check_hindsight_operation(n) for n in pending]
@@ -654,6 +765,8 @@ class BridgeLayer:
                     stats["hindsight_success"] = sum(hindsight_results)
                 finally:
                     self._client = None
+            # Keep a deletion failure visible if nothing later replaced it.
+            self.last_error = self.last_error or deletion_error
 
             logger.info(
                 f"Synced {stats['total']} concepts: {stats['mnemosyne_success']} to "

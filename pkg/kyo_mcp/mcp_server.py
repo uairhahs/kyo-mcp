@@ -26,9 +26,11 @@ from kyo_mcp.bridge import BridgeLayer
 from kyo_mcp.bundle import BundleError, export_bundle, import_bundle, validate_bundle
 from kyo_mcp.common import GENERATOR, is_stale, new_node_id, now_iso
 from kyo_mcp.database import (
+    clear_pending_deletion,
     get_all_links,
     get_concept_by_id,
     get_links,
+    get_pending_deletion,
     query_catalog,
 )
 from kyo_mcp.okf_schema import (
@@ -197,14 +199,42 @@ async def update_kyo_node(
 
 
 @kyo_tool
-async def delete_kyo_node(node_id: str) -> str:
-    """Delete a node and every link to or from it.
+async def delete_kyo_node(node_id: str, local_only: bool = False) -> str:
+    """Delete a node and every link to or from it, along with what it
+    synced to Hindsight and Mnemosyne.
 
-    Memories already synced to Mnemosyne or Hindsight are not removed.
+    If the remote delete fails, the node is kept so the delete can be
+    retried; local_only=True deletes it locally regardless and leaves any
+    synced memories behind.
+
+    Also takes the id of a node already gone from the catalogue because its
+    file was deleted, moved, or replaced: its synced memories are then
+    removed now instead of on the next sync (or kept, with local_only).
     """
-    if not store.delete_concept(node_id):
+    node = get_concept_by_id(node_id)
+    tombstone = get_pending_deletion(node_id)
+    if node is None and tombstone is None:
         raise ToolError(f"Node {node_id} not found in catalogue.")
-    return f"Node {node_id} deleted"
+    if local_only:
+        if node is not None:
+            store.delete_concept(node_id, tombstone=False)
+        clear_pending_deletion(node_id)
+        return f"Node {node_id} deleted locally; its synced memories were kept"
+
+    bridge = BridgeLayer()
+    result = await bridge.delete_concept_from_memory_systems(node_id)
+    if bridge.last_error:
+        kept = "Node" if node is not None else "Pending deletion of"
+        raise ToolError(
+            f"{kept} {node_id} kept: {bridge.last_error}. "
+            "Retry, or pass local_only=True to delete it locally only."
+        )
+    remote = f"hindsight: {result['hindsight']}, mnemosyne: {result['mnemosyne']}"
+    clear_pending_deletion(node_id)
+    if node is None:
+        return f"Removed the synced memories of {node_id}, already gone from the catalogue ({remote})"
+    store.delete_concept(node_id, tombstone=False)
+    return f"Node {node_id} deleted ({remote})"
 
 
 @kyo_tool
@@ -499,6 +529,12 @@ async def sync_all_to_memory_systems() -> str:
     output += f"  Synced to Mnemosyne: {stats['mnemosyne_success']}\n"
     output += f"  Queued or current in Hindsight: {stats['hindsight_success']}\n"
     output += f"  Hindsight extractions completed since last check: {stats['hindsight_completed']}\n"
+    if stats["deletions_completed"] or stats["deletions_failed"]:
+        output += (
+            "  Memories of removed nodes deleted: "
+            f"{stats['deletions_completed']} (failed, will retry: "
+            f"{stats['deletions_failed']})\n"
+        )
     if bridge.last_error:
         output += f"  Last error: {bridge.last_error}\n"
     return output
@@ -587,6 +623,12 @@ async def refresh_okf_bundle() -> str:
         f"unchanged: {report['unchanged']}, written: {report['written']}\n"
         f"  Broken links (tolerated): {report['broken_links']}\n"
     )
+    if report["pending_memory_deletions"]:
+        output += (
+            "  Removed nodes whose synced memories are still to be deleted: "
+            f"{report['pending_memory_deletions']} (deleted on the next "
+            "sync_all_to_memory_systems, or now with delete_kyo_node)\n"
+        )
     for title, items in (
         ("Errors", report["errors"]),
         ("Warnings", report["warnings"]),

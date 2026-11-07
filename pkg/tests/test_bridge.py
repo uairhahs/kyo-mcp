@@ -285,7 +285,9 @@ class TestSyncAll:
             patch(
                 "httpx.AsyncClient.request",
                 new_callable=AsyncMock,
-                return_value=_mock_response(200, hindsight.operation_status("completed")),
+                return_value=_mock_response(
+                    200, hindsight.operation_status("completed")
+                ),
             ),
             patch.object(
                 BridgeLayer, "sync_concept_to_mnemosyne", AsyncMock(return_value=True)
@@ -355,6 +357,124 @@ class TestBulkEfficiency:
 
         concept = OKFConcept(id="same", type="concept", title="T", description="D")
         assert await BridgeLayer().sync_concept_to_mnemosyne(concept) is True
+
+
+def _fake_mnemosyne(monkeypatch, memory_id="mem-new", forgotten=True):
+    import sys
+    import types
+
+    module = types.ModuleType("mnemosyne")
+    module.remember = MagicMock(return_value=memory_id)
+    module.forget = MagicMock(return_value=forgotten)
+    monkeypatch.setitem(sys.modules, "mnemosyne", module)
+    return module
+
+
+class TestMnemosyneMemoryTracking:
+    @pytest.mark.asyncio
+    async def test_resync_replaces_previous_memory(self, monkeypatch):
+        from kyo_mcp.database import create_concept, get_mnemosyne_memory_id
+
+        create_concept(
+            {"id": "n1", "type": "concept", "title": "T", "description": "D"}
+        )
+        mnemosyne = _fake_mnemosyne(monkeypatch, memory_id="mem-1")
+        bridge = BridgeLayer()
+        await bridge.sync_concept_to_mnemosyne(
+            OKFConcept(id="n1", type="concept", title="T", description="D")
+        )
+        assert get_mnemosyne_memory_id("n1") == "mem-1"
+        mnemosyne.forget.assert_not_called()
+
+        mnemosyne.remember.return_value = "mem-2"
+        await bridge.sync_concept_to_mnemosyne(
+            OKFConcept(id="n1", type="concept", title="T", description="Edited")
+        )
+        mnemosyne.forget.assert_called_once_with("mem-1")
+        assert get_mnemosyne_memory_id("n1") == "mem-2"
+
+
+class TestDeleteFromMemorySystems:
+    @pytest.fixture(autouse=True)
+    def node(self):
+        from kyo_mcp.database import create_concept
+
+        create_concept(
+            {"id": "n1", "type": "concept", "title": "T", "description": "D"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancels_pending_retain_then_deletes_document(self, monkeypatch):
+        from kyo_mcp.database import set_hindsight_operation
+
+        set_hindsight_operation("n1", "op-1", "hash")
+        bridge = BridgeLayer(hindsight_api_key=None)
+        with patch(
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            return_value=_mock_response(200),
+        ) as request:
+            result = await bridge.delete_concept_from_memory_systems("n1")
+        calls = [
+            (c.args[0], c.args[1].rsplit("/banks/kyo/", 1)[1])
+            for c in request.call_args_list
+        ]
+        assert calls == [("DELETE", "operations/op-1"), ("DELETE", "documents/n1")]
+        assert result == {"hindsight": "deleted", "mnemosyne": "untracked"}
+        assert bridge.last_error is None
+
+    @pytest.mark.asyncio
+    async def test_missing_document_is_not_an_error(self):
+        bridge = BridgeLayer()
+        with patch(
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            return_value=_mock_response(404, text="Document not found"),
+        ):
+            result = await bridge.delete_concept_from_memory_systems("n1")
+        assert result["hindsight"] == "not_found"
+        assert bridge.last_error is None
+
+    @pytest.mark.asyncio
+    async def test_http_error_sets_last_error(self):
+        bridge = BridgeLayer()
+        with patch(
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            return_value=_mock_response(500, text="boom"),
+        ):
+            result = await bridge.delete_concept_from_memory_systems("n1")
+        assert result["hindsight"] == "error"
+        assert "HTTP 500" in bridge.last_error
+
+    @pytest.mark.asyncio
+    async def test_forgets_tracked_mnemosyne_memory(self, monkeypatch):
+        from kyo_mcp.database import set_mnemosyne_memory_id
+
+        set_mnemosyne_memory_id("n1", "mem-1")
+        mnemosyne = _fake_mnemosyne(monkeypatch)
+        bridge = BridgeLayer()
+        with patch(
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            return_value=_mock_response(404),
+        ):
+            result = await bridge.delete_concept_from_memory_systems("n1")
+        mnemosyne.forget.assert_called_once_with("mem-1")
+        assert result == {"hindsight": "not_found", "mnemosyne": "deleted"}
+
+    @pytest.mark.asyncio
+    async def test_sends_auth_header_when_key_set(self):
+        bridge = BridgeLayer(hindsight_api_key="hsk_test")
+        with patch(
+            "httpx.AsyncClient.request",
+            new_callable=AsyncMock,
+            return_value=_mock_response(200),
+        ) as request:
+            await bridge.delete_concept_from_memory_systems("n1")
+        assert request.call_args.kwargs["headers"] == {
+            "Authorization": "Bearer hsk_test"
+        }
 
 
 class TestRetainRetry:
@@ -539,9 +659,7 @@ class TestMaterializeFromHindsight:
             stats = await bridge.materialize_from_hindsight("fact")
 
         assert stats == {"recalled": 1, "touched": 1, "created": 0}
-        matches = [
-            c for c in query_catalog() if c["id"] == "kyo-recall-mem-repeat"
-        ]
+        matches = [c for c in query_catalog() if c["id"] == "kyo-recall-mem-repeat"]
         assert len(matches) == 1
 
     @pytest.mark.asyncio

@@ -274,6 +274,7 @@ def refresh(db_path: Optional[Path] = None) -> Dict[str, Any]:
             "removed": 0,
             "unchanged": 0,
             "broken_links": 0,
+            "pending_memory_deletions": 0,
             "errors": [],
             "warnings": [],
         }
@@ -351,7 +352,9 @@ def refresh(db_path: Optional[Path] = None) -> Dict[str, Any]:
             gone = path not in files and row.get("file_stamp")
             replaced = path in ids and ids[path] != row["id"]
             if (gone or replaced) and row["id"] not in claimed:
-                db.delete_concept(row["id"], db_path=db_path)
+                # Removed outside Kyo's delete tool, so its synced memories
+                # (if any) still exist: leave a tombstone for the next sync.
+                db.delete_concept(row["id"], db_path=db_path, tombstone=True)
                 report["removed"] += 1
 
         for path, (concept, body, file, data) in parsed.items():
@@ -384,6 +387,7 @@ def refresh(db_path: Optional[Path] = None) -> Dict[str, Any]:
 
         if parsed or report["removed"] or report["written"]:
             report["broken_links"] = _rebuild_links(db_path)
+        report["pending_memory_deletions"] = len(db.list_pending_deletions(db_path))
         return report
 
 
@@ -489,10 +493,17 @@ def verify_concept(
         return True
 
 
-def delete_concept(concept_id: str, db_path: Optional[Path] = None) -> bool:
+def delete_concept(
+    concept_id: str, tombstone: bool = True, db_path: Optional[Path] = None
+) -> bool:
     """Delete a concept's file, and the typed links other files hold to it.
     Inline links to it in other bodies are text and stay, as broken links
-    (tolerated, §6.1). Returns False if it didn't exist."""
+    (tolerated, §6.1). Returns False if it didn't exist.
+
+    tombstone=True (the default) records that its synced memories, if any,
+    still need removing (see database.delete_concept). Pass False when they
+    were already removed, or are deliberately being kept.
+    """
     with _lock:
         refresh(db_path)
         row = db.get_concept_by_id(concept_id, db_path=db_path)
@@ -512,9 +523,10 @@ def delete_concept(concept_id: str, db_path: Optional[Path] = None) -> bool:
                 save_concept(source, kyo_links=kept, db_path=db_path)
         if path:
             concept_file(path, db_path).unlink(missing_ok=True)
+        # Remove the row here, with the caller's tombstone choice, so the
+        # refresh below doesn't see a vanished file and tombstone it anyway.
+        db.delete_concept(concept_id, db_path=db_path, tombstone=tombstone)
         refresh(db_path)
-        if db.get_concept_by_id(concept_id, db_path=db_path):  # had no file
-            db.delete_concept(concept_id, db_path=db_path)
         return True
 
 
