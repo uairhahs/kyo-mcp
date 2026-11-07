@@ -91,31 +91,31 @@ kyo/
 
 ## MCP Tools
 
-| Tool                          | Description                                                      |
-| ----------------------------- | ---------------------------------------------------------------- |
-| `create_kyo_node`             | Create an OKF node (status, `stale_after`, sources, body)        |
-| `get_kyo_node`                | Get a node as an OKF markdown bundle file or as Turtle RDF       |
-| `update_kyo_node`             | Update some fields of a node, keeping its verification history   |
-| `delete_kyo_node`             | Delete a node, its links, and its synced memories                |
-| `link_kyo_nodes`              | Connect two nodes with a directed, typed edge                    |
-| `unlink_kyo_nodes`            | Remove links between two nodes                                   |
-| `get_node_links`              | List a node's incoming and/or outgoing links                     |
-| `find_path`                   | Shortest chain of links between two nodes                        |
-| `search_knowledge`            | Full-text search over title, description, tags, and body         |
-| `verify_kyo_node`             | Mark a node as human-reviewed                                    |
-| `get_node_trust_status`       | Trust tier, freshness, and provenance metadata                   |
-| `sync_to_mnemosyne`           | Sync a node to the spaced repetition system                      |
-| `sync_to_hindsight`           | Queue a node for Hindsight fact extraction                       |
-| `check_hindsight_sync_status` | Check whether a queued Hindsight extraction has finished         |
-| `recall_from_hindsight`       | Semantic search across synced concepts                           |
-| `materialize_from_hindsight`  | Pull recalled Hindsight memories back in as catalogue nodes      |
-| `trigger_reflection`          | Generate insights from the knowledge base                        |
-| `trigger_consolidation`       | Strengthen memory associations                                   |
-| `sync_all_to_memory_systems`  | Sync every changed node, and check pending Hindsight extractions |
-| `export_okf_bundle`           | Write the catalogue as an OKF v0.2 bundle directory              |
-| `import_okf_bundle`           | Load an OKF bundle directory into the catalogue                  |
-| `validate_okf_bundle`         | Check a directory against OKF v0.2 conformance (§11)             |
-| `refresh_okf_bundle`          | Re-read the store's files and report edits, errors, conflicts    |
+| Tool                          | Description                                                                                                        |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `create_kyo_node`             | Create an OKF node (status, `stale_after`, sources, body)                                                          |
+| `get_kyo_node`                | Get a node as an OKF markdown bundle file or as Turtle RDF                                                         |
+| `update_kyo_node`             | Update some fields of a node, keeping its verification history                                                     |
+| `delete_kyo_node`             | Delete a node, its links, and its synced memories                                                                  |
+| `link_kyo_nodes`              | Connect two nodes with a directed, typed edge                                                                      |
+| `unlink_kyo_nodes`            | Remove links between two nodes                                                                                     |
+| `get_node_links`              | List a node's incoming and/or outgoing links                                                                       |
+| `find_path`                   | Shortest chain of links between two nodes                                                                          |
+| `search_knowledge`            | Full-text search over title, description, tags, and body                                                           |
+| `verify_kyo_node`             | Mark a node as human-reviewed                                                                                      |
+| `get_node_trust_status`       | Trust tier, freshness, and provenance metadata                                                                     |
+| `sync_to_mnemosyne`           | Sync a node to the spaced repetition system                                                                        |
+| `sync_to_hindsight`           | Queue a node for Hindsight fact extraction                                                                         |
+| `check_hindsight_sync_status` | Check whether a queued Hindsight extraction has finished                                                           |
+| `recall_from_hindsight`       | Semantic search across synced concepts                                                                             |
+| `materialize_from_hindsight`  | Pull recalled Hindsight memories back in as catalogue nodes                                                        |
+| `trigger_reflection`          | Generate insights from the knowledge base                                                                          |
+| `trigger_consolidation`       | Strengthen memory associations                                                                                     |
+| `sync_all_to_memory_systems`  | Sync every changed node, check pending Hindsight extractions, and remove the memories of nodes deleted outside Kyo |
+| `export_okf_bundle`           | Write the catalogue as an OKF v0.2 bundle directory                                                                |
+| `import_okf_bundle`           | Load an OKF bundle directory into the catalogue                                                                    |
+| `validate_okf_bundle`         | Check a directory against OKF v0.2 conformance (§11)                                                               |
+| `refresh_okf_bundle`          | Re-read the store's files and report edits, errors, conflicts                                                      |
 
 Failures are returned as MCP tool errors (`isError: true`), not as
 successful results containing error text.
@@ -137,7 +137,9 @@ conformant bundle. This is tested against Google's own sample bundles
   tool. Every MCP tool and CLI command first re-reads changed files
   (`refresh_okf_bundle` / `kyo-cli refresh` shows the report). A file that
   doesn't parse keeps its last indexed version until it's fixed. Deleting a
-  file deletes the node. A new file needs no id: one is derived from its
+  file deletes the node. Its synced Hindsight and Mnemosyne memories are removed on
+  the next `sync_all_to_memory_systems`, or straight away with
+  `delete_kyo_node` on its id. A new file needs no id: one is derived from its
   path, so every device indexing the same bundle agrees on it. Kyo writes
   `kyo_id` into a file when it next changes it, so the node keeps its id if
   the file is moved later.

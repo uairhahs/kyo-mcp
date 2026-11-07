@@ -111,8 +111,14 @@ def cmd_create_link(args: argparse.Namespace) -> Any:
 async def cmd_delete_concept(args: argparse.Namespace) -> Any:
     """Delete a concept, its links, and what it synced to the memory
     systems (unless --local-only). A failed remote delete keeps the concept
-    so it can be retried."""
-    _load_concept(args.concept_id)
+    so it can be retried. Also takes the id of a concept already gone from
+    the catalogue (its file deleted, moved, or replaced) whose memories are
+    still pending deletion."""
+    from kyo_mcp.database import clear_pending_deletion, get_pending_deletion
+
+    node = get_concept_by_id(args.concept_id)
+    if node is None and get_pending_deletion(args.concept_id) is None:
+        raise CommandError(f"Concept {args.concept_id} not found")
     result: dict[str, Any] = {"deleted": True, "concept_id": args.concept_id}
     if not args.local_only:
         bridge = _bridge()
@@ -122,7 +128,9 @@ async def cmd_delete_concept(args: argparse.Namespace) -> Any:
                 f"{bridge.last_error}; concept kept (retry, or use --local-only)"
             )
         result.update(remote)
-    store.delete_concept(args.concept_id)
+    clear_pending_deletion(args.concept_id)
+    if node is not None:
+        store.delete_concept(args.concept_id, tombstone=False)
     return result
 
 
