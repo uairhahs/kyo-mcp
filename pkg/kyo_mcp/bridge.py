@@ -416,7 +416,11 @@ class BridgeLayer:
                 response = await self._hindsight_request(
                     "DELETE", f"operations/{operation}", timeout=STATUS_TIMEOUT
                 )
-                if response.status_code not in (200, 404):
+                # 404: unknown operation. 409: no longer pending (it
+                # completed or failed), so there's nothing left to cancel.
+                # Either way the retain isn't running, which is all the
+                # cancel is for, so carry on and delete the document.
+                if response.status_code not in (200, 404, 409):
                     raise RuntimeError(
                         f"cancelling operation {operation}: "
                         f"HTTP {response.status_code} - {response.text}"
