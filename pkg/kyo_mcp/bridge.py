@@ -69,6 +69,10 @@ LLM_TIMEOUT = 180
 # Status polls don't touch the LLM pipeline, so they can fail fast.
 STATUS_TIMEOUT = 30
 
+# How many spent operation ids _hindsight_operation_id skips before it gives
+# up on the derived chain and submits under a random id.
+MAX_SPENT_OPERATION_IDS = 5
+
 # Reflect is synchronous and agentic: Hindsight runs several tool-calling
 # LLM turns while this request stays open, each turn on a growing context.
 # On a small local model a whole reflect can take many minutes (a 2B model
@@ -283,6 +287,95 @@ class BridgeLayer:
             self._fail(f"Failed to sync concept {concept.id} to Mnemosyne: {e}")
             return False
 
+    async def _operation_status(self, operation_id: str) -> Optional[str]:
+        """Hindsight's status for an operation id ("pending", "completed",
+        "failed", ...), or None when Hindsight doesn't know the id or the
+        check itself failed."""
+        try:
+            response = await self._hindsight_request(
+                "GET", f"operations/{operation_id}", timeout=STATUS_TIMEOUT
+            )
+        except Exception as e:
+            logger.warning(f"Checking Hindsight operation {operation_id}: {e}")
+            return None
+        if response.status_code != 200:
+            return None
+        status = response.json().get("status")
+        return status if isinstance(status, str) else None
+
+    async def _document_holds(self, node_id: str, content_hash: str) -> Optional[bool]:
+        """Whether Hindsight's document for this node holds exactly this
+        content: True, False (no document, or a different version of it),
+        or None when the check itself failed.
+
+        Hindsight's document content_hash is the same sha256 kyo's
+        _content_hash takes of the retained text. Comparing it, not just
+        the document's existence, matters because a replayed id can come
+        back completed while the document holds another version: content
+        A synced, then B (replacing the document), then back to A replays
+        A's old operation and retains nothing. A document that reports no
+        hash at all is taken at its word."""
+        try:
+            response = await self._hindsight_request(
+                "GET", f"documents/{node_id}", timeout=STATUS_TIMEOUT
+            )
+        except Exception as e:
+            logger.warning(f"Checking Hindsight document {node_id}: {e}")
+            return None
+        if response.status_code == 404:
+            return False
+        if response.status_code != 200:
+            return None
+        held = response.json().get("content_hash")
+        return not held or held == content_hash
+
+    async def _hindsight_operation_id(
+        self, node_id: str, new_hash: str
+    ) -> tuple[str, bool]:
+        """The operation id to submit this content under, and whether that
+        content is in fact already in Hindsight.
+
+        The id is derived from the node and content hash so that a resubmit
+        after a lost acknowledgement replays the same operation. But
+        Hindsight replays a known id no matter what has happened since: a
+        completed operation whose document was later deleted (a cleanup, a
+        delete_concept, a migration) is reported completed again and
+        retains nothing. So a derived id is checked before it is used:
+          - unknown, pending or processing: use it (a fresh submit, or a
+            replay of work still in flight);
+          - completed and the node's document holds this content:
+            nothing to submit;
+          - completed with the document missing or holding another
+            version, failed or cancelled: the id is
+            spent, so it is recorded as failed and the next one in the
+            chain (seeded after it) is tried.
+        If a check itself fails, the derived id is used as before.
+        """
+        for _ in range(MAX_SPENT_OPERATION_IDS):
+            seed = f"kyo-hindsight:{node_id}:{new_hash}"
+            failed = get_failed_hindsight_operation(node_id, db_path=self.db_path)
+            if failed:
+                seed += f":after:{failed}"
+            operation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
+            status = await self._operation_status(operation_id)
+            if status == "completed":
+                holds = await self._document_holds(node_id, new_hash)
+                if holds is None:
+                    return operation_id, False
+                if holds:
+                    return operation_id, True
+            elif status not in ("failed", "cancelled"):
+                return operation_id, False
+            logger.info(
+                f"Hindsight operation {operation_id} for {node_id} is spent "
+                f"({status}{', document missing or another version' if status == 'completed' else ''}); "
+                "deriving the next id"
+            )
+            fail_hindsight_operation(node_id, operation_id, db_path=self.db_path)
+        # A chain this long means something else is wrong; a random id
+        # still gets the content in.
+        return str(uuid.uuid4()), False
+
     async def sync_concept_to_hindsight(self, concept: OKFConcept) -> bool:
         """Submit an OKF concept to Hindsight for fact extraction.
 
@@ -335,13 +428,19 @@ class BridgeLayer:
             # operation". Reusing an id against different content gets
             # HTTP 409 instead, which is why this is derived from new_hash
             # rather than concept.id alone. Hindsight replays a known id
-            # even when that operation failed, so after a failure the id
-            # is also derived from the failed one to get a real retry.
-            seed = f"kyo-hindsight:{concept.id}:{new_hash}"
-            failed = get_failed_hindsight_operation(concept.id, db_path=self.db_path)
-            if failed:
-                seed += f":after:{failed}"
-            operation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
+            # even when that operation failed, or completed and its
+            # document was deleted since, so a spent id is skipped for the
+            # next one in its chain (see _hindsight_operation_id).
+            operation_id, already = await self._hindsight_operation_id(
+                concept.id, new_hash
+            )
+            if already:
+                set_sync_hash(concept.id, "hindsight", new_hash, db_path=self.db_path)
+                logger.info(
+                    f"Skipping {concept.id}: operation {operation_id} already "
+                    "completed and its document is in Hindsight"
+                )
+                return True
 
             response = await self._hindsight_request(
                 "POST",
@@ -491,6 +590,27 @@ class BridgeLayer:
             body = response.json()
             status = body.get("status")
 
+            if (
+                status == "completed"
+                and await self._document_holds(node_id, pending_hash) is False
+            ):
+                # A replayed id (see _hindsight_operation_id) reports the
+                # old completion without retaining anything, so completed
+                # only counts once the node's document really holds this
+                # content.
+                fail_hindsight_operation(node_id, operation_id, db_path=self.db_path)
+                logger.warning(
+                    f"Hindsight operation {operation_id} for {node_id} completed "
+                    "but its document is missing or holds another version; it will be "
+                    "resubmitted under a new id"
+                )
+                return {
+                    "state": "failed",
+                    "operation_id": operation_id,
+                    "error": "operation completed but this node's document is missing "
+                    "or holds another version; resubmit to retain it under a new "
+                    "operation id",
+                }
             if status == "completed":
                 set_sync_hash(node_id, "hindsight", pending_hash, db_path=self.db_path)
                 clear_hindsight_operation(node_id, db_path=self.db_path)
@@ -704,17 +824,56 @@ class BridgeLayer:
             )
         return stats
 
-    async def sync_all_concepts(self) -> Dict[str, int]:
+    async def _verify_hindsight_documents(
+        self, concepts: List[OKFConcept], stats: Dict[str, int]
+    ) -> None:
+        """For each node recorded as synced with nothing in flight, check
+        that Hindsight's document holds the recorded content; clear the
+        record of any that doesn't, so the sync that follows resubmits it."""
+        recorded = [
+            (c.id, h)
+            for c in concepts
+            if (h := get_sync_hash(c.id, "hindsight", db_path=self.db_path))
+            and not get_hindsight_operation(c.id, db_path=self.db_path)
+        ]
+        held = await self._gather_limited(
+            [self._document_holds(node_id, h) for node_id, h in recorded]
+        )
+        for (node_id, _), holds in zip(recorded, held, strict=True):
+            if holds is None:
+                stats["hindsight_unverified"] += 1
+            elif holds:
+                stats["hindsight_verified"] += 1
+            else:
+                stats["hindsight_stale"] += 1
+                set_sync_hash(node_id, "hindsight", None, db_path=self.db_path)
+                logger.warning(
+                    f"{node_id}: its Hindsight document is missing or holds "
+                    "another version; resubmitting"
+                )
+
+    async def sync_all_concepts(self, verify: bool = False) -> Dict[str, int]:
         """Sync all concepts from the database to external systems.
 
         In-flight Hindsight operations are polled first, so any that have
         completed since the last run are recorded as synced and not
         resubmitted.
 
+        An unchanged node is skipped on its stored sync hash alone, without
+        asking Hindsight, so a document deleted or replaced on the Hindsight
+        side is never noticed. With verify=True each node recorded as synced
+        is checked first (one status request per node): if its document is
+        missing or holds another version, the record is cleared and the node
+        is resubmitted in this same run. A node whose check fails is left
+        as recorded and counted as unverified.
+
         Returns:
             Dictionary of counts: total, mnemosyne_success,
             hindsight_success (queued or already current),
-            hindsight_completed (in-flight operations found finished), and
+            hindsight_completed (in-flight operations found finished),
+            hindsight_verified / hindsight_stale / hindsight_unverified
+            (verify only: documents confirmed, found missing or another
+            version and resubmitted, or not checkable), and
             deletions_completed / deletions_failed (memories of concepts
             removed outside the delete tool, see process_pending_deletions)
         """
@@ -723,6 +882,9 @@ class BridgeLayer:
             "mnemosyne_success": 0,
             "hindsight_success": 0,
             "hindsight_completed": 0,
+            "hindsight_verified": 0,
+            "hindsight_stale": 0,
+            "hindsight_unverified": 0,
             "deletions_completed": 0,
             "deletions_failed": 0,
         }
@@ -748,6 +910,8 @@ class BridgeLayer:
                     stats["hindsight_completed"] = sum(
                         r["state"] == "completed" for r in checks
                     )
+                    if verify:
+                        await self._verify_hindsight_documents(concepts, stats)
 
                     # Hindsight submissions are independent network calls,
                     # so they run concurrently. Mnemosyne's remember() runs

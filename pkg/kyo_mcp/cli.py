@@ -176,8 +176,9 @@ async def cmd_materialize_from_hindsight(args: argparse.Namespace) -> Any:
 
 
 async def cmd_sync_all(args: argparse.Namespace) -> Any:
-    """Sync all concepts."""
-    return await _bridge().sync_all_concepts()
+    """Sync all concepts; --verify first checks every synced node's Hindsight
+    document and resubmits any that is missing or holds another version."""
+    return await _bridge().sync_all_concepts(verify=args.verify)
 
 
 async def cmd_trigger_consolidation(args: argparse.Namespace) -> Any:
@@ -293,7 +294,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=10)
     p.set_defaults(func=cmd_materialize_from_hindsight)
 
-    subparsers.add_parser("sync_all").set_defaults(func=cmd_sync_all)
+    p = subparsers.add_parser("sync_all")
+    p.add_argument(
+        "--verify",
+        action="store_true",
+        help="check each synced node's Hindsight document first (one request per node)",
+    )
+    p.set_defaults(func=cmd_sync_all)
     subparsers.add_parser("trigger_consolidation").set_defaults(
         func=cmd_trigger_consolidation
     )

@@ -337,7 +337,10 @@ class TestBulkEfficiency:
         assert stats["total"] == 12
         assert stats["hindsight_success"] == 12
         assert stats["mnemosyne_success"] == 12
-        assert request.await_count == 12
+        # One status check of the derived operation id, then the submit.
+        methods = [c.args[0] for c in request.await_args_list]
+        assert methods.count("POST") == 12
+        assert methods.count("GET") == 12
         assert len(opened) == 1
 
     @pytest.mark.asyncio
@@ -519,6 +522,225 @@ class TestRetainRetry:
 
         clear_hindsight_operation("n1")
         assert (await submit()).call_args.kwargs["json"]["operation_id"] == retry
+
+
+class _FakeHindsight:
+    """A Hindsight that knows some operations and holds some documents,
+    routing each request by method and path."""
+
+    def __init__(self, operations=None, documents=None):
+        self.operations = dict(operations or {})
+        self.documents = dict(documents or {})  # node id -> content_hash
+        self.broken = set()  # document ids whose check fails
+        self.posted = []
+
+    def __call__(self, method, url, **kwargs):  # AsyncMock awaits the result
+        path = url.rsplit("/banks/kyo/", 1)[1]
+        kind, _, name = path.partition("/")
+        if method == "GET" and kind == "operations":
+            if name in self.operations:
+                return _mock_response(
+                    200, hindsight.operation_status(self.operations[name], name)
+                )
+            return _mock_response(404, text="Operation not found")
+        if method == "GET" and kind == "documents" and name in self.broken:
+            return _mock_response(500, text="boom")
+        if method == "GET" and kind == "documents":
+            if name in self.documents:
+                return _mock_response(
+                    200, {"id": name, "content_hash": self.documents[name]}
+                )
+            return _mock_response(404, text="Document not found")
+        if method == "POST" and path == "memories":
+            operation_id = kwargs["json"]["operation_id"]
+            self.posted.append(operation_id)
+            self.operations.setdefault(operation_id, "pending")
+            return _mock_response(200, hindsight.retain_response(operation_id))
+        raise AssertionError(f"unexpected {method} {path}")
+
+
+def _derived_id(node_id, content_hash, after=None):
+    import uuid
+
+    seed = f"kyo-hindsight:{node_id}:{content_hash}"
+    if after:
+        seed += f":after:{after}"
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
+
+
+class TestSpentOperationIds:
+    """Hindsight replays a known operation id whatever happened since: a
+    completed operation whose document was deleted reports completed again
+    and retains nothing. Seen for real after old Hindsight documents were
+    deleted: re-syncing unchanged nodes replayed their September
+    operations, every check said completed, and no document came back."""
+
+    @staticmethod
+    def _node():
+        from kyo_mcp.bridge import _content_hash
+        from kyo_mcp.database import create_concept
+
+        create_concept({"id": "n1", "type": "concept", "title": "Node"})
+        concept = _concept().model_copy(
+            update={"id": "n1", "title": "Node", "description": None}
+        )
+        return concept, _content_hash("Node: ")
+
+    @pytest.mark.asyncio
+    async def test_spent_ids_are_skipped_for_the_next_in_the_chain(self):
+        from kyo_mcp.database import get_failed_hindsight_operation
+
+        concept, h = self._node()
+        first = _derived_id("n1", h)
+        second = _derived_id("n1", h, after=first)
+        # The first submit failed; its retry completed, and the document it
+        # left was deleted later.
+        fake = _FakeHindsight({first: "failed", second: "completed"})
+        with patch("httpx.AsyncClient.request", new_callable=AsyncMock) as request:
+            request.side_effect = fake
+            assert await BridgeLayer().sync_concept_to_hindsight(concept)
+        assert fake.posted == [_derived_id("n1", h, after=second)]
+        assert get_failed_hindsight_operation("n1") == second
+
+    @pytest.mark.asyncio
+    async def test_completed_with_its_document_is_not_resubmitted(self):
+        from kyo_mcp.database import get_hindsight_operation, get_sync_hash
+
+        concept, h = self._node()
+        fake = _FakeHindsight({_derived_id("n1", h): "completed"}, documents={"n1": h})
+        with patch("httpx.AsyncClient.request", new_callable=AsyncMock) as request:
+            request.side_effect = fake
+            assert await BridgeLayer().sync_concept_to_hindsight(concept)
+        assert fake.posted == []
+        assert get_sync_hash("n1", "hindsight") == h
+        assert get_hindsight_operation("n1") is None
+
+    @pytest.mark.asyncio
+    async def test_completed_id_whose_document_holds_another_version_is_spent(self):
+        """Content A synced, then B replaced the document, then the node went
+        back to A: A's old operation would replay completed and retain
+        nothing, leaving B in Hindsight."""
+        concept, h = self._node()
+        first = _derived_id("n1", h)
+        fake = _FakeHindsight({first: "completed"}, documents={"n1": "hash-of-b"})
+        with patch("httpx.AsyncClient.request", new_callable=AsyncMock) as request:
+            request.side_effect = fake
+            assert await BridgeLayer().sync_concept_to_hindsight(concept)
+        assert fake.posted == [_derived_id("n1", h, after=first)]
+
+    @pytest.mark.asyncio
+    async def test_in_flight_id_is_still_reused(self):
+        """A resubmit while the first is still running must replay it, not
+        start a second retain of the same content."""
+        concept, h = self._node()
+        first = _derived_id("n1", h)
+        fake = _FakeHindsight({first: "processing"})
+        with patch("httpx.AsyncClient.request", new_callable=AsyncMock) as request:
+            request.side_effect = fake
+            assert await BridgeLayer().sync_concept_to_hindsight(concept)
+        assert fake.posted == [first]
+
+    @pytest.mark.asyncio
+    async def test_check_does_not_trust_a_completion_without_a_document(self):
+        from kyo_mcp.database import (
+            get_failed_hindsight_operation,
+            get_hindsight_operation,
+            get_sync_hash,
+            set_hindsight_operation,
+        )
+
+        concept, h = self._node()
+        set_hindsight_operation("n1", "op-old", h)
+        fake = _FakeHindsight({"op-old": "completed"})
+        with patch("httpx.AsyncClient.request", new_callable=AsyncMock) as request:
+            request.side_effect = fake
+            state = await BridgeLayer().check_hindsight_operation("n1")
+        assert state["state"] == "failed"
+        assert get_failed_hindsight_operation("n1") == "op-old"
+        assert get_hindsight_operation("n1") is None
+        assert get_sync_hash("n1", "hindsight") is None
+
+        # Completed, but the document holds another version.
+        set_hindsight_operation("n1", "op-mid", h)
+        fake.operations["op-mid"] = "completed"
+        fake.documents["n1"] = "hash-of-b"
+        with patch("httpx.AsyncClient.request", new_callable=AsyncMock) as request:
+            request.side_effect = fake
+            state = await BridgeLayer().check_hindsight_operation("n1")
+        assert state["state"] == "failed"
+        assert get_sync_hash("n1", "hindsight") is None
+
+        fake.documents["n1"] = h
+        set_hindsight_operation("n1", "op-new", h)
+        fake.operations["op-new"] = "completed"
+        with patch("httpx.AsyncClient.request", new_callable=AsyncMock) as request:
+            request.side_effect = fake
+            state = await BridgeLayer().check_hindsight_operation("n1")
+        assert state["state"] == "completed"
+        assert get_sync_hash("n1", "hindsight") == h
+
+
+class TestSyncAllVerify:
+    """sync_all skips a node on kyo's own record of what it synced, so a
+    document deleted or replaced on the Hindsight side goes unnoticed
+    unless verify asks Hindsight."""
+
+    @staticmethod
+    def _nodes():
+        from kyo_mcp.bridge import _content_hash
+        from kyo_mcp.database import create_concept, set_sync_hash
+
+        hashes = {}
+        for name in ("held", "gone", "other", "broken"):
+            create_concept({"id": name, "type": "concept", "title": name})
+            hashes[name] = _content_hash(f"{name}: ")
+            set_sync_hash(name, "hindsight", hashes[name])
+        return hashes
+
+    async def _sync_all(self, fake, verify):
+        with (
+            patch("httpx.AsyncClient.request", new_callable=AsyncMock) as request,
+            patch.object(
+                BridgeLayer, "sync_concept_to_mnemosyne", AsyncMock(return_value=True)
+            ),
+        ):
+            request.side_effect = fake
+            return await BridgeLayer().sync_all_concepts(verify=verify)
+
+    @pytest.mark.asyncio
+    async def test_verify_resubmits_only_missing_or_replaced_documents(self):
+        from kyo_mcp.database import get_hindsight_operation, get_sync_hash
+
+        h = self._nodes()
+        fake = _FakeHindsight(
+            documents={"held": h["held"], "other": "hash-of-b", "broken": h["broken"]}
+        )
+        fake.broken.add("broken")
+        stats = await self._sync_all(fake, verify=True)
+        assert (
+            stats["hindsight_verified"],
+            stats["hindsight_stale"],
+            stats["hindsight_unverified"],
+        ) == (1, 2, 1)
+        posted = {
+            n
+            for n in h
+            if get_hindsight_operation(n)
+            and get_hindsight_operation(n)[0] in fake.posted
+        }
+        assert posted == {"gone", "other"}
+        assert len(fake.posted) == 2
+        assert get_sync_hash("held", "hindsight") == h["held"]
+        assert get_sync_hash("broken", "hindsight") == h["broken"]
+
+    @pytest.mark.asyncio
+    async def test_without_verify_nothing_is_checked_or_resubmitted(self):
+        self._nodes()
+        fake = _FakeHindsight()
+        stats = await self._sync_all(fake, verify=False)
+        assert fake.posted == []
+        assert stats["hindsight_success"] == 4
+        assert stats["hindsight_stale"] == 0
 
 
 class TestHindsightRetainCarriesProvenance:

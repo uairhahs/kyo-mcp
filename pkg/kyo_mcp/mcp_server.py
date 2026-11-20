@@ -515,20 +515,33 @@ async def trigger_consolidation() -> str:
 
 
 @kyo_tool
-async def sync_all_to_memory_systems() -> str:
+async def sync_all_to_memory_systems(verify: bool = False) -> str:
     """Sync all knowledge nodes to Mnemosyne and Hindsight.
 
     Unchanged nodes are skipped. In-flight Hindsight operations are checked
     first, so completed ones are recorded rather than resubmitted.
+
+    Args:
+        verify: first check each synced node's Hindsight document (one
+            request per node) and resubmit any that is missing or holds
+            another version. Skipping relies on kyo's own record, so a
+            document deleted on the Hindsight side is otherwise never
+            noticed.
     """
     bridge = BridgeLayer()
-    stats = await bridge.sync_all_concepts()
+    stats = await bridge.sync_all_concepts(verify=verify)
 
     output = "Sync completed:\n"
     output += f"  Total concepts: {stats['total']}\n"
     output += f"  Synced to Mnemosyne: {stats['mnemosyne_success']}\n"
     output += f"  Queued or current in Hindsight: {stats['hindsight_success']}\n"
     output += f"  Hindsight extractions completed since last check: {stats['hindsight_completed']}\n"
+    if verify:
+        output += (
+            f"  Hindsight documents verified: {stats['hindsight_verified']}, "
+            f"missing or another version (resubmitted): {stats['hindsight_stale']}, "
+            f"not checkable: {stats['hindsight_unverified']}\n"
+        )
     if stats["deletions_completed"] or stats["deletions_failed"]:
         output += (
             "  Memories of removed nodes deleted: "
